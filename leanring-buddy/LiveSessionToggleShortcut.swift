@@ -2,7 +2,7 @@
 //  LiveSessionToggleShortcut.swift
 //  leanring-buddy
 //
-//  Detects the fn + control shortcut that starts and ends a live session.
+//  Detects the fn + control shortcut that turns hands-free mode on and off.
 //  The user holds the keys for a moment (see CompanionManager) so a stray
 //  tap doesn't toggle the session by accident.
 //

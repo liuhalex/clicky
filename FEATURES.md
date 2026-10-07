@@ -6,7 +6,7 @@ HeyClicky has that aren't in this repo; others are new ideas.
 
 The short version for reviewers is [PITCH.md](PITCH.md).
 
-*Last updated: 2026-10-07 (first commit on `feature/live-session`).*
+*Last updated: 2026-10-07 (branch `feature/live-session`).*
 
 **Origin key**
 - **New**: my own idea, not in Clicky or HeyClicky as far as I know
@@ -22,15 +22,16 @@ The short version for reviewers is [PITCH.md](PITCH.md).
 
 | Feature | Origin | Status |
 |---|---|---|
-| [Live session (fn + control)](#live-session) | New | Built, tried |
+| [The pointer follows what it points at](#the-pointer-follows-what-it-points-at) | New | Built, tried |
 | [On-device element tracking](#on-device-element-tracking) | New | Built, tried |
 | [Anchored scroll following](#anchored-scroll-following) | New | Built, tried (shake fix not yet re-tried) |
 | [Flight steering toward moving targets](#flight-steering) | New | Built, tried |
 | [Point while explaining, then let go](#point-while-explaining-then-let-go) | ❓ | Built |
 | ["It scrolled off the top" voice announcement](#lost-element-announcement) | New | Built, tried |
 | [Re-find when scrolled back ("there it is!")](#re-find-when-scrolled-back) | New | Built |
-| [Two listening modes: push-to-talk and hands-free](#listening-modes) | New | Built, tried (Mac-audio filter not yet confirmed) |
-| [Mode ring: blue vs orange](#mode-ring) | New | Built |
+| [Hands-free mode (fn + control)](#hands-free-mode) | New | Built, tried (Mac-audio filter not yet confirmed) |
+| [Hands-free ring](#hands-free-ring) | New | Built |
+| [Cost compared to the original Clicky](#cost-compared-to-the-original-clicky) | Analysis | Done |
 | [Token-anxiety design](#token-anxiety-design) | New | Built |
 | [Point and draw while talking](#point-and-draw-while-talking) | ❓ | Planned |
 | [Repo fixes: working tests, local setup](#repo-fixes) | Fixes to existing repo | Built |
@@ -41,19 +42,25 @@ Also see [Improvements and Bug Fixes](#improvements-and-bug-fixes) for everythin
 
 ---
 
-## Live Session
+## The Pointer Follows What It Points At
 **Origin:** New (confirmed: HeyClicky has no continuous screen watching) · **Status:** Built, tried
 
 - **Problem:** Clicky takes one screenshot when you release the push-to-talk keys. If you scroll afterward, it points at where the element *used* to be.
-- **What it does:** hold **fn + control** for ~0.6s to start a session, and again to end it. During a session Clicky watches the screen continuously, so questions use what's on screen *right now*.
-- **How it works:** one ScreenCaptureKit stream per display at 12 fps. It only delivers frames when something changes, so a still screen costs almost nothing. The whole Clicky app is excluded from capture, so the tracker never sees the buddy itself.
-- **Privacy:** frames stay on the Mac. Only the frames attached to a question are sent, same as a normal screenshot.
-- **Files:** `LiveSessionScreenWatcher.swift`, `LiveSessionToggleShortcut.swift`, `CompanionManager.swift` (Live Session section)
+- **What it does:** whenever Clicky points at something, on any question, the cursor stays on that element while you scroll, flick, or drag the window.
+- **How it works:**
+  - When Clicky points, it starts watching the screen with one ScreenCaptureKit stream per display at 12 fps. The stream only delivers frames when something changes, so a still screen costs almost nothing.
+  - Tracking starts from the exact screenshot Claude saw, so it locks onto the right element even if you scrolled while Claude was answering.
+  - Watching stops once the buddy is back at your cursor (see [Point While Explaining](#point-while-explaining-then-let-go)).
+  - The whole Clicky app is excluded from capture, so the tracker never sees the buddy itself.
+- **Privacy:** frames stay on the Mac. Only the screenshot attached to a question is sent, same as before. macOS shows its screen-recording indicator only for those few seconds.
+- **Two kinds of "seeing":** the Mac watching the screen (local frames and plain math for tracking) is free. Claude seeing the screen happens only when you ask a question, with one fresh screenshot, exactly like the original Clicky.
+- **Switching screens:** each question takes a fresh screenshot when you let go of the keys, so Claude always sees the current screen. If you switch screens while Clicky is pointing, the tracker notices the element is gone and quietly lets go.
+- **Files:** `LiveSessionScreenWatcher.swift`, `CompanionManager.swift` (Screen Watching section)
 
 ## On-Device Element Tracking
 **Origin:** New · **Status:** Built, tried
 
-- **What it does:** after Claude points at something, the buddy follows that element as the page scrolls or the window moves.
+- **What it does:** finds the element Claude pointed at again in every new frame.
 - **Key decision: Claude finds it once, the Mac tracks it.** Streaming the screen to Claude would be seconds behind and cost roughly $10+/hour per user. Tracking runs locally, for free, in ~15ms per frame.
 - **How it works:**
   1. Save a small grayscale image (164×68px) around Claude's point.
@@ -91,16 +98,16 @@ Also see [Improvements and Bug Fixes](#improvements-and-bug-fixes) for everythin
 ## Point While Explaining, Then Let Go
 **Origin:** ❓ · **Status:** Built
 
-- In a session the buddy points while Clicky explains, then lets go **4s after Clicky stops talking**. Scrolling restarts the countdown, so it stays while you're still looking.
+- The buddy points while Clicky explains, then lets go **4s after Clicky stops talking**. Scrolling restarts the countdown, so it stays while you're still looking.
 - Clicking the element, asking something new, or losing the element also ends pointing.
-- Outside a session, the original behavior is unchanged (fly back after 3s).
+- If the area around the point is too plain to track (e.g. empty background), the buddy points without following and flies back after 3s, like the original Clicky.
 
 ## Lost-Element Announcement
 **Origin:** New · **Status:** Built, tried
 
 - **Only when it was scrolled away:** if it vanished because you switched pages, tabs, or apps, Clicky quietly stops pointing and says nothing. Commenting on every page change felt creepy.
 - When the element leaves the screen, Clicky **says** where it went, using Claude's label for it. For example: *"the save button scrolled off the top of your screen. scroll back up a little and it'll be right there."*
-- **Direction:** comes from the scroll-driven position estimate first, then from the tracker's last position and motion. If it vanished mid-screen: *"i can't see the export menu anymore. it was near the top left of your screen, so something might be covering it now."*
+- **Direction:** comes from the scroll-driven position estimate first, then from the tracker's last position and motion.
 - It waits for Clicky to finish its answer instead of talking over it.
 - **Files:** `LostTrackedElementAnnouncement.swift`
 
@@ -110,46 +117,61 @@ Also see [Improvements and Bug Fixes](#improvements-and-bug-fixes) for everythin
 - After an element is lost, the tracker keeps looking for it for 20s. If you scroll it back into view, the announcement stops mid-sentence and the buddy flies back saying **"there it is!"**
 - Only an unmistakable match counts, so a look-alike can't trigger it.
 
-## Listening Modes
+## Hands-Free Mode
 **Origin:** New (confirmed: HeyClicky has no hands-free mode) · **Status:** Built, tried (Mac-audio filter not yet confirmed)
 
-- **Push-to-talk** (the default): hold ctrl + option.
-- **Hands-free:** just start talking, no keys needed. Clicky picks up your question when you speak and sends it once you've gone 1.2s without new words. It's meant for tutoring-style sessions.
-- **Only answers when you're talking to it:** with the mic open, Clicky overhears things that aren't for it (talking to someone else, a call, a video). In hands-free mode only, Claude is told to reply exactly `[SILENT]` if the speech wasn't said to it, and then Clicky says nothing, points at nothing, and keeps it out of the conversation history. Push-to-talk always answers.
+- **What it does:** hold **fn + control** (~0.6s) to turn hands-free on, and again to turn it off. While it's on, you just talk, with no keys needed. Clicky picks up your question when you speak and sends it once you've gone 1.2s without new words. Push-to-talk (ctrl + option) is the default and always works.
+- **How it got here:** first built as a "live session" with two modes (push-to-talk and hands-free) switched by double-tapping a key, first option and then command. Once the pointer followed every point, a session's only remaining purpose was hands-free, so it became a single toggle with nothing to switch.
+- **Why there's no "live push-to-talk" mode:** it would feel identical to normal push-to-talk (same following, same cost). Its only difference is answers about 0.1–0.3s faster, because there's no fresh screenshot to take, and it has two downsides: you'd have to remember to start it, and the screen-recording indicator would stay on. Continuous watching earns its own mode only if Clicky starts using screen *history* (e.g. "what was that error that just flashed?").
+- **Only answers when you're talking to it:** with the mic open, Clicky overhears things that aren't for it (talking to someone else, a call, a video). For hands-free speech, Claude is told to reply exactly `[SILENT]` if it wasn't said to it, and then Clicky says nothing, points at nothing, and keeps it out of the conversation history. Push-to-talk always answers.
 - **Privacy:** speech is transcribed on the Mac (Apple Speech with on-device recognition, which this Mac supports), so your voice never leaves it. Only a finished question of 2+ words goes to Claude.
 - **Naming:** first called "always listening," which sounded like surveillance, so it was renamed "hands-free" and described as "just start talking."
-- **Ignores the Mac's own speakers:** a video or podcast playing on the Mac would otherwise get picked up and sent as a question. In hands-free mode, Clicky also transcribes what the Mac is playing (captured through ScreenCaptureKit, Clicky's own voice excluded, recognized on-device). If the mic heard the same sentence, it's dropped silently: no waveform, nothing sent.
+- **Ignores the Mac's own speakers:** a video or podcast playing on the Mac would otherwise get picked up and sent as a question. While hands-free is on, Clicky also transcribes what the Mac is playing (captured through ScreenCaptureKit, Clicky's own voice excluded, recognized on-device). If the mic heard the same sentence, it's dropped silently: no waveform, nothing sent.
   - **Echo test:** the mic's words must line up, in order, with **one stretch** of the Mac's audio (3+ words, 60%+ of what was heard). A real question that shares common words with a long video doesn't count, because those words are scattered.
-  - **Not used:** Apple's built-in echo cancellation (voice processing). On macOS it mainly cancels the app's own playback and turns down other audio while the mic is on, so your music would stay quiet for the whole session.
+  - **Not used:** Apple's built-in echo cancellation (voice processing). On macOS it mainly cancels the app's own playback and turns down other audio while the mic is on, so your music would stay quiet the whole time.
   - Sound from *other* devices (a phone, a TV, another person) isn't filtered, by design.
-- **Double-tap command** switches between the two. Only clean taps count: shortcuts like command + c or command + tab don't trigger it. (Double-tap option was the first choice, but it's a common shortcut for opening other apps, like Claude.)
 - **Safeguards:**
   - The mic pauses while Clicky thinks and talks, so it never hears itself.
   - Anything under 2 words ("hm", "okay") is ignored.
   - Push-to-talk always takes over the mic.
 - **Limits:** you can't interrupt Clicky mid-answer, and a loud room can trigger questions.
-- **Files:** `ModifierKeyDoubleTapDetector.swift`, `ComputerAudioEchoDetector.swift`, `ComputerAudioSpeechTranscriber.swift`, `CompanionManager.swift` (Live Session Supervisor, Listening Mode)
+- **Files:** `LiveSessionToggleShortcut.swift`, `ComputerAudioEchoDetector.swift`, `ComputerAudioSpeechTranscriber.swift`, `CompanionManager.swift` (Live Session Supervisor)
 
-## Mode Ring
+## Hands-Free Ring
 **Origin:** New · **Status:** Built
 
-- A ring that **breathes around the buddy means the session is live**, in both modes.
-- **Its color shows the mode:** blue for push-to-talk (mic off), **orange for hands-free**. The orange matches the dot macOS shows when an app is using the microphone, so the meaning is already familiar.
+- An **orange ring breathes around the buddy while hands-free is on**. No ring means push-to-talk as usual.
+- The orange matches the dot macOS shows when an app is using the microphone, so the meaning is already familiar.
 - **Tried and dropped:**
   - A mic/keyboard badge, which looked cluttered on screen all the time.
-  - Dashed vs solid, which was too subtle once both modes pulse.
+  - Dashed vs solid, which was too subtle.
+  - A blue ring for push-to-talk sessions, which stopped making sense once sessions became hands-free only.
   - A sonar ripple and a voice-reactive ring, which were also considered.
+
+## Cost Compared to the Original Clicky
+
+| | Original Clicky | Now |
+|---|---|---|
+| Claude calls per question | 1 | 1 |
+| What's sent | 1 screenshot (1280px) + question + history | identical (hands-free questions add ~120 tokens of instructions) |
+| Cost per question | ~2,400 input tokens + a short answer ≈ 1¢ (Sonnet 4.6) | same |
+| Pointer following | n/a | local, $0 (a little CPU while pointing) |
+| Hands-free listening | n/a | $0: speech and the Mac's audio are transcribed on-device |
+| Extra API cost | n/a | overheard speech that reaches Claude costs one call (~1¢) even when it replies `[SILENT]` |
+
+- **Why hands-free is affordable:** the original Clicky uses AssemblyAI, which bills per hour of streamed audio. An always-open mic on that would cost money the whole time it's on. On-device Apple Speech makes it free.
+- **Possible saving:** check whether overheard speech was meant for Clicky with a cheap text-only call (e.g. Haiku, no screenshot) before the full call.
 
 ## Token-Anxiety Design
 **Origin:** New · **Status:** Built
 
-- **The worry:** "the session is on, so it must be burning tokens."
-- **Reality:** watching and tracking are local and free. Claude is only called per question, at the same cost as push-to-talk. Hands-free mode adds one real risk (stray speech sending a question), which the safeguards above reduce.
+- **The worry:** "hands-free is on, so it must be burning tokens."
+- **Reality:** watching, tracking, and transcription are local and free. Claude is only called per question, at the same cost as push-to-talk. Hands-free adds one real risk (stray speech sending a question), which the safeguards above reduce.
 - **Design:**
-  - The session starts with a status bubble ("hold ctrl + option to talk · double-tap command to go hands-free"), and switching to hands-free says *"hands-free · just start talking."*
-  - It ends with a receipt: *"session ended · 3 questions sent."*
-  - Forgotten sessions **end themselves after 10 quiet minutes**.
-- **Ideas not built:** a live question counter in the menu bar panel, a flash on the ring at the moment something is sent, a per-session question cap.
+  - Turning it on says *"hands-free on · just start talking."*
+  - Turning it off shows a receipt: *"hands-free off · 3 questions sent."*
+  - Forgotten hands-free **turns itself off after 10 quiet minutes**.
+- **Ideas not built:** a live question counter in the menu bar panel, a flash on the ring at the moment something is sent, a question cap.
 
 ## Point and Draw While Talking
 **Origin:** ❓ · **Status:** Planned
@@ -171,7 +193,7 @@ Also see [Improvements and Bug Fixes](#improvements-and-bug-fixes) for everythin
   2. `TEST_HOST` pointed at `leanring-buddy.app` instead of `Clicky.app`.
   3. The tests imported `leanring_buddy` instead of the actual module, `Clicky`.
   4. The original test struct was missing `@MainActor`.
-- **Now:** 53 tests across 8 suites, run with Cmd+U.
+- **Now:** 45 tests across 7 suites, run with Cmd+U.
 - **Local development setup:**
   - Signing set to my personal team.
   - The Worker runs locally (`npx wrangler dev`) and the app points at `http://localhost:8787`.
@@ -191,7 +213,7 @@ Also see [Improvements and Bug Fixes](#improvements-and-bug-fixes) for everythin
   | Sonnet 5.5 + computer use tool | 12/12 | 1px | ~5,900 |
 
 - **Finding:** Claude's coordinates are accurate on a clean page, so switching to the computer use tool would add cost (~2.4× tokens) without helping here. The error most likely comes from what happens *after* Claude points:
-  - live session tracking drifting onto a look-alike,
+  - tracking drifting onto a look-alike,
   - a miscalibrated scroll estimate,
   - Clicky pointing at one thing while talking about several,
   - or real screens being much busier than the test page.
@@ -207,13 +229,15 @@ Things found and fixed while building, newest first. These make a good story for
 
 | Problem | How it was found | Fix |
 |---|---|---|
-| Clicky commented after switching pages in a session ("I can't see it anymore…") | User feedback | Lost-element announcement only plays when the element was scrolled away; page/tab/app switches end pointing silently |
-| Hands-free answered speech that wasn't meant for it (background conversation) | User testing + log | In hands-free, Claude replies `[SILENT]` when not addressed; Clicky stays quiet |
+| Two shortcuts and two concepts (a "live session" plus a double-tap mode switch) for what was really just hands-free | Design review once pointer-following worked everywhere | fn + control now turns hands-free on and off. Removed the session concept, the double-tap toggle, and the blue ring |
+| Pointer only followed scrolling inside a live session; a normal push-to-talk point stayed put | User testing (session was off, so the pointer didn't follow) | Watch the screen just while pointing, on every question |
+| Clicky commented after switching pages ("I can't see it anymore…") | User feedback | Lost-element announcement only plays when the element was scrolled away; page/tab/app switches end pointing silently |
+| Hands-free answered speech that wasn't meant for it (background conversation) | User testing + log | For hands-free speech, Claude replies `[SILENT]` when not addressed; Clicky stays quiet |
 | Hands-free picked up audio playing on the Mac itself (videos, podcasts) | User testing | Transcribe the Mac's own audio on-device and drop mic speech that matches one stretch of it (6 tests) |
 | "Always listening" sounded scary | User feedback | Renamed to **hands-free** ("just start talking"); confirmed speech is transcribed on-device, so voice never leaves the Mac |
 | Couldn't tell why pointing was off | User report | Debug recorder plus an accuracy experiment (see above) |
-| Mode badge (mic/keyboard icons) looked cluttered | User feedback | Ring color shows the mode instead: blue = push-to-talk, orange = hands-free |
-| Double-tap option opens other apps (Claude) | User feedback | Switched to double-tap command; Cmd+C/V/Tab and Cmd+Shift don't count (tests) |
+| Mode badge (mic/keyboard icons) looked cluttered | User feedback | Ring color showed the mode instead (later simplified to an orange ring for hands-free only) |
+| Double-tap option opens other apps (Claude) | User feedback | Switched to double-tap command (later removed entirely, see the first row) |
 | After scrolling a lost element back, Clicky kept saying it was gone | User testing | Keep searching for 20s after losing it; stop the announcement and fly back ("there it is!") when re-found |
 | Lost element announced as "disappeared on the left" when it was really scrolled off the top | Debug log | Use the scroll-driven estimate to pick the direction; the tracker loses elements a few frames before they leave |
 | Buddy shook while scrolling | User testing | Blend frame corrections in (35% per frame) instead of snapping; only snap for jumps over 60pt |
@@ -241,4 +265,3 @@ Things found and fixed while building, newest first. These make a good story for
   - The app controls the lesson loop: explain → check understanding → practice → hint.
   - Hands-free mode for answering.
   - Prompt caching on the lesson context to keep long lessons cheap.
-

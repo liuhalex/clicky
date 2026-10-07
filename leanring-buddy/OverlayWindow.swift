@@ -92,17 +92,12 @@ struct LiveSessionStatusBubbleSizePreferenceKey: PreferenceKey {
     }
 }
 
-/// A thin ring that slowly breathes around the buddy for as long as a live
-/// session is on. Its color shows the listening mode without any extra icons:
-/// blue in push-to-talk (mic off), orange in hands-free (mic on),
-/// matching the orange dot macOS shows when the microphone is in use.
+/// A thin orange ring that slowly breathes around the buddy while hands-free
+/// mode is on, matching the orange dot macOS shows when the microphone is in
+/// use. No ring means push-to-talk as usual.
 private struct LiveSessionIndicatorRingView: View {
-    let isHandsFreeListeningOn: Bool
     private let pulseDurationSeconds: Double = 1.6
-
-    private var ringColor: Color {
-        isHandsFreeListeningOn ? DS.Colors.overlayHandsFreeOrange : DS.Colors.overlayCursorBlue
-    }
+    private let ringColor = DS.Colors.overlayHandsFreeOrange
 
     var body: some View {
         TimelineView(.animation) { timelineContext in
@@ -116,7 +111,6 @@ private struct LiveSessionIndicatorRingView: View {
                 .frame(width: 30, height: 30)
                 .scaleEffect(1.0 + breathAmount * 0.15)
                 .shadow(color: ringColor.opacity(0.6), radius: 4, x: 0, y: 0)
-                .animation(.easeInOut(duration: 0.4), value: isHandsFreeListeningOn)
         }
     }
 }
@@ -360,7 +354,7 @@ struct BlueCursorView: View {
                     }
             }
 
-            // Live session status — "live session on", "session ended", etc.
+            // Hands-free status — "hands-free on", "hands-free off", etc.
             // Sits above the buddy so it never collides with the pointing bubble.
             if buddyIsVisibleOnThisScreen, let liveSessionStatusBubbleText = companionManager.liveSessionStatusBubbleText {
                 Text(liveSessionStatusBubbleText)
@@ -388,11 +382,9 @@ struct BlueCursorView: View {
                     }
             }
 
-            // Live session ring — a slow pulse around the buddy for as long as
-            // the session is on, so the user always knows Clicky is watching.
-            LiveSessionIndicatorRingView(
-                isHandsFreeListeningOn: companionManager.liveSessionListeningMode == .handsFree
-            )
+            // Hands-free ring — a slow orange pulse around the buddy for as long
+            // as hands-free is on, so the user always knows Clicky is listening.
+            LiveSessionIndicatorRingView()
                 .opacity(
                     companionManager.isLiveSessionActive
                         && buddyIsVisibleOnThisScreen

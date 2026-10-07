@@ -21,17 +21,6 @@ enum CompanionVoiceState {
     case responding
 }
 
-/// How the user talks to Clicky during a live session. Double tapping
-/// command switches between the two.
-enum LiveSessionListeningMode {
-    /// Hold ctrl + option to talk. The microphone is off otherwise.
-    case pushToTalk
-    /// Just start talking, no keys needed: Clicky picks up a question when the
-    /// user speaks and sends it once they stop. Speech is transcribed on this
-    /// Mac, so nothing leaves it until a question is sent. Good for tutoring.
-    case handsFree
-}
-
 @MainActor
 final class CompanionManager: ObservableObject {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
@@ -55,20 +44,17 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Live Session State
 
-    /// True while a live session is on (toggled by holding fn + control).
-    /// During a session Clicky watches the screen continuously and keeps
-    /// pointing at an element as it moves.
+    /// True while hands-free mode is on (toggled by holding fn + control).
+    /// Internally this is a "live session": the screen and the Mac's audio are
+    /// watched continuously and the microphone listens whenever Clicky is quiet.
     @Published private(set) var isLiveSessionActive = false
-    /// Short status message shown next to the cursor ("live session on",
-    /// "session ended", ...). Nil when no message is showing.
+    /// Short status message shown next to the cursor ("hands-free on",
+    /// "hands-free off · 3 questions sent", ...). Nil when nothing is showing.
     @Published private(set) var liveSessionStatusBubbleText: String?
     /// Where the element Claude pointed at is right now (global AppKit coords),
     /// updated as the user scrolls or moves the window. Nil when nothing is
     /// being tracked. BlueCursorView moves the pointing buddy to follow it.
     @Published private(set) var liveTrackedElementScreenLocation: CGPoint?
-    /// Every session starts in push-to-talk. Hands-free is opt-in (double tap
-    /// command) because an open microphone is the bigger ask.
-    @Published private(set) var liveSessionListeningMode: LiveSessionListeningMode = .pushToTalk
 
     // MARK: - Onboarding Video State (shared across all screen overlays)
 
@@ -125,7 +111,7 @@ final class CompanionManager: ObservableObject {
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
 
-    /// How long fn + control must be held to start or end a live session.
+    /// How long fn + control must be held to turn hands-free on or off.
     /// Long enough that brushing the keys doesn't toggle it by accident.
     private static let liveSessionToggleHoldDurationSeconds: Double = 0.6
     /// If the tracked element can't be found for this long (scrolled away,
@@ -136,7 +122,6 @@ final class CompanionManager: ObservableObject {
     private static let liveTrackedElementClickDismissRadiusInPoints: CGFloat = 60
 
     private var liveSessionShortcutTransitionCancellable: AnyCancellable?
-    private var commandDoubleTapCancellable: AnyCancellable?
     private var pendingLiveSessionToggleTask: Task<Void, Never>?
     /// Prevents a second toggle while the screen stream is still starting or stopping.
     private var isLiveSessionStartingOrStopping = false
@@ -166,6 +151,10 @@ final class CompanionManager: ObservableObject {
     private var lostTrackedElementSearchStartedDate = Date.distantPast
     private var liveSessionStatusBubbleHideTask: Task<Void, Never>?
     private var liveSessionMouseClickMonitor: Any?
+    /// True while the screen is being watched outside a live session, only so
+    /// the pointer can follow the element Clicky is pointing at. Stops once
+    /// the pointing is over.
+    private var isWatchingScreenForCurrentPoint = false
     /// Watches trackpad / scroll wheel events during a session so the buddy
     /// moves with scrolled content instantly instead of waiting for frames.
     private var liveSessionScrollWheelMonitor: Any?
@@ -321,7 +310,6 @@ final class CompanionManager: ObservableObject {
         bindAudioPowerLevel()
         bindShortcutTransitions()
         bindLiveSessionShortcutTransitions()
-        bindCommandDoubleTap()
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
@@ -444,12 +432,10 @@ final class CompanionManager: ObservableObject {
     }
 
     func stop() {
-        if isLiveSessionActive {
-            let liveSessionScreenWatcherToStop = liveSessionScreenWatcher
-            Task { await liveSessionScreenWatcherToStop?.stop() }
+        if let liveSessionScreenWatcherToStop = liveSessionScreenWatcher {
+            Task { await liveSessionScreenWatcherToStop.stop() }
         }
         liveSessionShortcutTransitionCancellable?.cancel()
-        commandDoubleTapCancellable?.cancel()
         pendingLiveSessionToggleTask?.cancel()
         liveSessionSupervisorTask?.cancel()
         removeLiveSessionMouseClickMonitor()
@@ -817,6 +803,8 @@ final class CompanionManager: ObservableObject {
                 } else {
                     screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
                 }
+                // Same clock as frame and scroll-event timestamps, for tracking
+                let screenCaptureSystemUptime = ProcessInfo.processInfo.systemUptime
 
                 guard !Task.isCancelled else { return }
 
@@ -926,6 +914,19 @@ final class CompanionManager: ObservableObject {
                     )
                     #endif
                     print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
+
+                    // Outside a live session, watch the screen just while
+                    // pointing so the pointer follows the element too.
+                    if !isLiveSessionActive {
+                        await startFollowingPointedElementOutsideSession(
+                            screenshotImageData: targetScreenCapture.imageData,
+                            screenshotCaptureSystemUptime: screenCaptureSystemUptime,
+                            displayFrame: targetScreenCapture.displayFrame,
+                            targetLocationInScreenshotPixels: clampedScreenshotPixelLocation,
+                            initialGlobalLocation: globalLocation,
+                            elementLabel: parseResult.elementLabel
+                        )
+                    }
                 } else {
                     print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
                 }
@@ -1072,41 +1073,23 @@ final class CompanionManager: ObservableObject {
             isOverlayVisible = true
         }
 
-        let newLiveSessionScreenWatcher = LiveSessionScreenWatcher()
-        let newComputerAudioSpeechTranscriber = ComputerAudioSpeechTranscriber()
-        newLiveSessionScreenWatcher.onComputerAudioBuffer = { computerAudioBuffer in
-            newComputerAudioSpeechTranscriber.appendComputerAudioBuffer(computerAudioBuffer)
-        }
-        newLiveSessionScreenWatcher.onElementTrackingUpdate = { [weak self] trackingUpdate in
-            Task { @MainActor [weak self] in
-                self?.handleLiveElementTrackingUpdate(trackingUpdate)
-            }
-        }
-        newLiveSessionScreenWatcher.onStreamStoppedUnexpectedly = { [weak self] _ in
-            Task { @MainActor [weak self] in
-                await self?.endLiveSession(statusMessage: "live session stopped")
-            }
+        // A session replaces any short-lived watching for a single point
+        if isWatchingScreenForCurrentPoint {
+            await stopScreenWatching()
         }
 
-        do {
-            try await newLiveSessionScreenWatcher.start()
-        } catch {
-            print("⚠️ Live session: couldn't start screen stream: \(error)")
-            showLiveSessionStatusBubble("couldn't start live session")
+        guard await startScreenWatching(capturesComputerAudio: true) else {
+            showLiveSessionStatusBubble("couldn't turn on hands-free")
             scheduleTransientHideIfNeeded()
             return
         }
 
-        liveSessionScreenWatcher = newLiveSessionScreenWatcher
-        computerAudioSpeechTranscriber = newComputerAudioSpeechTranscriber
         isLiveSessionActive = true
-        installLiveSessionMouseClickMonitor()
-        installLiveSessionScrollWheelMonitor()
         liveSessionQuestionCount = 0
         liveSessionLastActivityDate = Date()
-        liveSessionListeningMode = .pushToTalk
+        computerAudioSpeechTranscriber?.setTranscriptionEnabled(true)
         startLiveSessionSupervisor()
-        showLiveSessionStatusBubble("live session on · hold ctrl + option to talk · double-tap command to go hands-free")
+        showLiveSessionStatusBubble("hands-free on · just start talking")
         print("🔴 Live session started")
     }
 
@@ -1117,6 +1100,67 @@ final class CompanionManager: ObservableObject {
         isLiveSessionStartingOrStopping = true
         defer { isLiveSessionStartingOrStopping = false }
 
+        isLiveSessionActive = false
+        await stopScreenWatching()
+
+        let questionCountSummary = liveSessionQuestionCount == 1
+            ? "1 question sent"
+            : "\(liveSessionQuestionCount) questions sent"
+        showLiveSessionStatusBubble(statusMessage ?? "hands-free off · \(questionCountSummary)")
+        print("⚪️ Live session ended (\(questionCountSummary))")
+        scheduleTransientHideIfNeeded()
+    }
+
+    // MARK: - Screen Watching
+
+    /// Starts the screen stream, the click and scroll monitors, and the
+    /// supervisor. Live sessions keep this running the whole time. Outside a
+    /// session it runs only while Clicky points at something, so the pointer
+    /// can follow the element as the user scrolls or moves the window.
+    private func startScreenWatching(capturesComputerAudio: Bool) async -> Bool {
+        let newLiveSessionScreenWatcher = LiveSessionScreenWatcher(capturesComputerAudio: capturesComputerAudio)
+
+        var newComputerAudioSpeechTranscriber: ComputerAudioSpeechTranscriber? = nil
+        if capturesComputerAudio {
+            let computerAudioSpeechTranscriberForSession = ComputerAudioSpeechTranscriber()
+            newLiveSessionScreenWatcher.onComputerAudioBuffer = { computerAudioBuffer in
+                computerAudioSpeechTranscriberForSession.appendComputerAudioBuffer(computerAudioBuffer)
+            }
+            newComputerAudioSpeechTranscriber = computerAudioSpeechTranscriberForSession
+        }
+
+        newLiveSessionScreenWatcher.onElementTrackingUpdate = { [weak self] trackingUpdate in
+            Task { @MainActor [weak self] in
+                self?.handleLiveElementTrackingUpdate(trackingUpdate)
+            }
+        }
+        newLiveSessionScreenWatcher.onStreamStoppedUnexpectedly = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.isLiveSessionActive {
+                    await self.endLiveSession(statusMessage: "hands-free stopped")
+                } else {
+                    await self.stopScreenWatching()
+                }
+            }
+        }
+
+        do {
+            try await newLiveSessionScreenWatcher.start()
+        } catch {
+            print("⚠️ Screen watching: couldn't start screen stream: \(error)")
+            return false
+        }
+
+        liveSessionScreenWatcher = newLiveSessionScreenWatcher
+        computerAudioSpeechTranscriber = newComputerAudioSpeechTranscriber
+        installLiveSessionMouseClickMonitor()
+        installLiveSessionScrollWheelMonitor()
+        startLiveSessionSupervisor()
+        return true
+    }
+
+    private func stopScreenWatching() async {
         liveSessionSupervisorTask?.cancel()
         liveSessionSupervisorTask = nil
         if isHandsFreeDictationActive {
@@ -1132,15 +1176,66 @@ final class CompanionManager: ObservableObject {
         liveSessionScreenWatcher = nil
         computerAudioSpeechTranscriber?.setTranscriptionEnabled(false)
         computerAudioSpeechTranscriber = nil
-        isLiveSessionActive = false
+        isWatchingScreenForCurrentPoint = false
         await liveSessionScreenWatcherToStop?.stop()
+    }
 
-        let questionCountSummary = liveSessionQuestionCount == 1
-            ? "1 question sent"
-            : "\(liveSessionQuestionCount) questions sent"
-        showLiveSessionStatusBubble(statusMessage ?? "session ended · \(questionCountSummary)")
-        print("⚪️ Live session ended (\(questionCountSummary))")
-        scheduleTransientHideIfNeeded()
+    /// Outside a live session: watch the screen while Clicky points, so the
+    /// pointer follows the element. Tracking starts from the exact screenshot
+    /// Claude saw, so it locks onto the right element even if the user
+    /// scrolled while Claude was answering.
+    private func startFollowingPointedElementOutsideSession(
+        screenshotImageData: Data,
+        screenshotCaptureSystemUptime: TimeInterval,
+        displayFrame: CGRect,
+        targetLocationInScreenshotPixels: CGPoint,
+        initialGlobalLocation: CGPoint,
+        elementLabel: String?
+    ) async {
+        guard let screenshotClaudeSaw = NSBitmapImageRep(data: screenshotImageData)?.cgImage else { return }
+
+        if liveSessionScreenWatcher == nil {
+            guard await startScreenWatching(capturesComputerAudio: false) else { return }
+            isWatchingScreenForCurrentPoint = true
+            print("👀 Watching the screen while pointing")
+        }
+
+        // The user may have asked something new while the stream was starting
+        guard !Task.isCancelled,
+              detectedElementScreenLocation == initialGlobalLocation,
+              let displayID = liveSessionScreenWatcher?.displayID(forDisplayFrame: displayFrame) else {
+            return
+        }
+
+        startLiveElementTracking(
+            referenceFrame: LiveScreenFrame(
+                cgImage: screenshotClaudeSaw,
+                displayID: displayID,
+                displayFrame: displayFrame,
+                captureTimestamp: screenshotCaptureSystemUptime
+            ),
+            targetLocationInScreenshotPixels: targetLocationInScreenshotPixels,
+            initialGlobalLocation: initialGlobalLocation,
+            elementLabel: elementLabel
+        )
+    }
+
+    /// Ends the short-lived watching once the pointing is fully over: not
+    /// tracking, not searching for a lost element, and the buddy is back.
+    private func stopWatchingForCurrentPointIfDone() {
+        guard isWatchingScreenForCurrentPoint,
+              !isLiveSessionActive,
+              !isResponsePipelineRunning,
+              liveTrackedElementScreenLocation == nil,
+              !isSearchingForLostTrackedElement,
+              detectedElementScreenLocation == nil else {
+            return
+        }
+        isWatchingScreenForCurrentPoint = false
+        print("👀 Done pointing, stopped watching the screen")
+        Task {
+            await stopScreenWatching()
+        }
     }
 
     private func startLiveElementTracking(
@@ -1347,48 +1442,17 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    // MARK: - Listening Mode
-
-    private func bindCommandDoubleTap() {
-        commandDoubleTapCancellable = globalPushToTalkShortcutMonitor
-            .commandDoubleTapPublisher
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] in
-                self?.toggleLiveSessionListeningMode()
-            }
-    }
-
-    /// Double tapping command switches between push-to-talk and hands-free.
-    /// Only meaningful during a live session.
-    func toggleLiveSessionListeningMode() {
-        guard isLiveSessionActive else { return }
-
-        switch liveSessionListeningMode {
-        case .pushToTalk:
-            liveSessionListeningMode = .handsFree
-            computerAudioSpeechTranscriber?.setTranscriptionEnabled(true)
-            showLiveSessionStatusBubble("hands-free · just start talking")
-        case .handsFree:
-            liveSessionListeningMode = .pushToTalk
-            computerAudioSpeechTranscriber?.setTranscriptionEnabled(false)
-            if isHandsFreeDictationActive {
-                cancelHandsFreeDictation()
-            }
-            showLiveSessionStatusBubble("push to talk · hold ctrl + option")
-        }
-        print("🎙️ Live session listening mode: \(liveSessionListeningMode)")
-    }
-
     // MARK: - Live Session Supervisor
 
     private func startLiveSessionSupervisor() {
         liveSessionSupervisorTask?.cancel()
         liveSessionSupervisorTask = Task {
-            while !Task.isCancelled && isLiveSessionActive {
+            while !Task.isCancelled && liveSessionScreenWatcher != nil {
                 superviseHandsFreeListening()
                 releaseTrackedElementIfExplanationIsOver()
                 stopSearchingForLostTrackedElementIfTimedOut()
                 endLiveSessionIfIdleTooLong()
+                stopWatchingForCurrentPointIfDone()
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
         }
@@ -1404,7 +1468,7 @@ final class CompanionManager: ObservableObject {
             isLostTrackedElementAnnouncementSpeaking = false
         }
 
-        guard liveSessionListeningMode == .handsFree else {
+        guard isLiveSessionActive else {
             if isHandsFreeDictationActive {
                 cancelHandsFreeDictation()
             }
@@ -1590,14 +1654,15 @@ final class CompanionManager: ObservableObject {
     }
 
     private func endLiveSessionIfIdleTooLong() {
-        guard !isResponsePipelineRunning,
+        guard isLiveSessionActive,
+              !isResponsePipelineRunning,
               !elevenLabsTTSClient.isPlaying,
               !hasHandsFreeListeningHeardSpeech,
               Date().timeIntervalSince(liveSessionLastActivityDate) >= Self.liveSessionAutoEndAfterIdleSeconds else {
             return
         }
         Task {
-            await endLiveSession(statusMessage: "session ended after 10 quiet minutes")
+            await endLiveSession(statusMessage: "hands-free off after 10 quiet minutes")
         }
     }
 

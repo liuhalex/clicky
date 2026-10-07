@@ -63,6 +63,15 @@ nonisolated final class LiveSessionScreenWatcher: NSObject, SCStreamOutput, SCSt
     /// Computer audio has its own queue so speech processing never delays frames.
     private let computerAudioProcessingQueue = DispatchQueue(label: "com.clicky.live-session-computer-audio")
 
+    /// Only live sessions need the Mac's audio (for hands-free mode). Watching
+    /// the screen just while pointing at something captures video only.
+    private let capturesComputerAudio: Bool
+
+    init(capturesComputerAudio: Bool) {
+        self.capturesComputerAudio = capturesComputerAudio
+        super.init()
+    }
+
     /// All streams deliver frames on this one serial queue, so tracking never
     /// runs twice at the same time.
     private let frameProcessingQueue = DispatchQueue(label: "com.clicky.live-session-frame-processing")
@@ -122,7 +131,7 @@ nonisolated final class LiveSessionScreenWatcher: NSObject, SCStreamOutput, SCSt
 
                 // System audio is the same on every display, so only the first
                 // stream captures it. Clicky's own voice is excluded.
-                let shouldCaptureComputerAudio = displayIndex == 0
+                let shouldCaptureComputerAudio = capturesComputerAudio && displayIndex == 0
                 if shouldCaptureComputerAudio {
                     streamConfiguration.capturesAudio = true
                     streamConfiguration.excludesCurrentProcessAudio = true
@@ -215,6 +224,15 @@ nonisolated final class LiveSessionScreenWatcher: NSObject, SCStreamOutput, SCSt
         }
 
         return (screenCaptures, framesWithCursorScreenFirst)
+    }
+
+    /// The display ID of the streamed display with this frame (AppKit
+    /// coordinates), used to track an element from a regular screenshot.
+    @MainActor
+    func displayID(forDisplayFrame displayFrame: CGRect) -> CGDirectDisplayID? {
+        watcherStateLock.withLock {
+            displayInfoByStreamIdentifier.values.first { $0.displayFrame == displayFrame }?.displayID
+        }
     }
 
     // MARK: - Element Tracking
