@@ -1,6 +1,6 @@
 # Clicky Live Sessions
 
-Alex Liu · Demo video: [link] · Branch: `feature/live-session` · Full log: [FEATURES.md](FEATURES.md)
+Alex Liu · Branch: `feature/live-session` · Full log: [FEATURES.md](FEATURES.md)
 
 ## The problem
 
