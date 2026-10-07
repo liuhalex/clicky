@@ -20,6 +20,7 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
 - **Voice Input**: Push-to-talk via `AVAudioEngine` + pluggable transcription-provider layer. System-wide keyboard shortcut via listen-only CGEvent tap.
 - **Element Pointing**: Claude embeds `[POINT:x,y:label:screenN]` tags in responses. The overlay parses these, maps coordinates to the correct monitor, and animates the blue cursor along a bezier arc to the target.
+- **Live Session**: Holding fn + control (0.6s) toggles a live session. During a session a ScreenCaptureKit stream per display keeps the latest frame (used instantly for push-to-talk questions), and the element Claude points at is tracked on-device with template matching so the buddy keeps pointing at it while the user scrolls or moves the window. Trackpad scroll events move the buddy instantly and frame matches only correct drift, so it stays anchored. The buddy lets go 4s after Clicky stops talking (scrolling restarts the countdown); if the element leaves the screen, Clicky says where it went, and keeps looking for it for 20s so scrolling back makes the buddy return ("there it is!"). Sessions start in push-to-talk; double-tapping command toggles hands-free mode (just start talking; mic listens whenever Clicky is quiet, a question ends after 1.2s without new words, nothing is sent to Claude until the user talks). The ring breathing around the buddy means the session is live; it's blue in push-to-talk and orange (like the macOS mic-in-use dot) in hands-free mode. In hands-free mode the Mac's own audio output is captured (ScreenCaptureKit audio, own process excluded) and transcribed on-device; mic speech that lines up with one stretch of it is dropped as echo. Push-to-talk (ctrl + option) works in both modes. Sessions end themselves after 10 idle minutes and report how many questions were sent.
 - **Concurrency**: `@MainActor` isolation, async/await throughout
 - **Analytics**: PostHog via `ClickyAnalytics.swift`
 
@@ -46,26 +47,36 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 
 **Shared URLSession for AssemblyAI**: A single long-lived `URLSession` is shared across all AssemblyAI streaming sessions (owned by the provider, not the session). Creating and invalidating a URLSession per session corrupts the OS connection pool and causes "Socket is not connected" errors after a few rapid reconnections.
 
-**Transient Cursor Mode**: When "Show Clicky" is off, pressing the hotkey fades in the cursor overlay for the duration of the interaction (recording → response → TTS → optional pointing), then fades it out automatically after 1 second of inactivity.
+**Transient Cursor Mode**: When "Show Clicky" is off, pressing the hotkey fades in the cursor overlay for the duration of the interaction (recording → response → TTS → optional pointing), then fades it out automatically after 1 second of inactivity. During a live session the overlay stays visible until the session ends.
+
+**Live Session Tracking Runs On-Device**: Claude is only called when the user speaks. Streaming frames to Claude continuously would be seconds behind and expensive, so the pointed-at element is followed locally: a 164x68px grayscale template around Claude's point is matched (normalized cross-correlation via Accelerate's `vDSP_imgfir`) against every new frame at 1/4 resolution with a light blur. Apple's Vision `VNTrackObjectRequest` was evaluated and rejected — it lost elements at scroll speeds above ~30px/frame while still reporting high confidence. Matches near the motion-predicted location are favored (score penalty 0.0004 per pixel of distance) so identical list rows don't swap; a match far away, or any match when the element is leaving the screen, must be near-perfect and unique. The stream excludes the whole app (not just current windows) so the tracker never sees the buddy itself. The 0.0004 penalty is tuned: halving it breaks identical-row tracking, doubling it breaks fast-flick tracking (see `LiveSessionTests.swift`).
 
 ## Key Files
 
 | File | Lines | Purpose |
 |------|-------|---------|
 | `leanring_buddyApp.swift` | ~89 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
-| `CompanionManager.swift` | ~1026 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
+| `CompanionManager.swift` | ~1859 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline, plus the live session lifecycle (hold-to-toggle, hands-free listening supervisor, tracking updates, lost-element announcement, click-to-dismiss, idle auto-end). |
 | `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
 | `CompanionPanelView.swift` | ~761 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
-| `OverlayWindow.swift` | ~881 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
+| `OverlayWindow.swift` | ~1138 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. In a live session, keeps pointing while following the tracked element, and shows the pulsing session ring and status bubble. |
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
-| `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
+| `CompanionScreenCaptureUtility.swift` | ~151 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. Also owns the screenshot size and Claude screen-label rules shared with the live session stream. |
+| `LiveSessionScreenWatcher.swift` | ~276 | Live session screen stream. One `SCStream` per display (12fps, own app excluded), keeps the latest frame per display, builds Claude screen captures from them, and runs element tracking on a background queue. |
+| `ScreenElementTemplateTracker.swift` | ~518 | On-device element tracking for live sessions. Grayscale downscaling + blur, NCC template matching with Accelerate, and the motion-aware rules that decide when a match is trusted. Pure logic, unit tested. |
+| `TrackedElementPositionEstimator.swift` | ~136 | Anchors the tracked element's position to scroll events between frames, re-anchors (blended) on each frame match, and self-calibrates the scroll-to-screen scale. Pure logic, unit tested. |
+| `LostTrackedElementAnnouncement.swift` | ~184 | Works out where a lost element went (off the top, off the left, covered mid-screen) and the spoken sentence + status bubble text. Pure logic, unit tested. |
+| `ModifierKeyDoubleTapDetector.swift` | ~99 | Detects a clean double tap of command (no other keys/modifiers involved) to switch live session listening modes. Pure logic, unit tested. |
+| `ComputerAudioEchoDetector.swift` | ~80 | Decides whether hands-free mic speech was really the Mac's own speakers (word alignment against one stretch of the computer audio transcript). Pure logic, unit tested. |
+| `ComputerAudioSpeechTranscriber.swift` | ~150 | On-device transcription of the Mac's audio output during hands-free mode, kept for 60s for echo checks. |
+| `LiveSessionToggleShortcut.swift` | ~47 | Detects the fn + control live session shortcut from global keyboard events. |
 | `BuddyDictationManager.swift` | ~866 | Push-to-talk voice pipeline. Handles microphone capture via `AVAudioEngine`, provider-aware permission checks, keyboard/button dictation sessions, transcript finalization, shortcut parsing, contextual keyterms, and live audio-level reporting for waveform feedback. |
 | `BuddyTranscriptionProvider.swift` | ~100 | Protocol surface and provider factory for voice transcription backends. Resolves provider based on `VoiceTranscriptionProvider` in Info.plist — AssemblyAI, OpenAI, or Apple Speech. |
 | `AssemblyAIStreamingTranscriptionProvider.swift` | ~478 | Streaming transcription provider. Fetches temp tokens from the Cloudflare Worker, opens an AssemblyAI v3 websocket, streams PCM16 audio, tracks turn-based transcripts, and delivers finalized text on key-up. Shares a single URLSession across all sessions. |
 | `OpenAIAudioTranscriptionProvider.swift` | ~317 | Upload-based transcription provider. Buffers push-to-talk audio locally, uploads as WAV on release, returns finalized transcript. |
 | `AppleSpeechTranscriptionProvider.swift` | ~147 | Local fallback transcription provider backed by Apple's Speech framework. |
 | `BuddyAudioConversionSupport.swift` | ~108 | Audio conversion helpers. Converts live mic buffers to PCM16 mono audio and builds WAV payloads for upload-based providers. |
-| `GlobalPushToTalkShortcutMonitor.swift` | ~132 | System-wide push-to-talk monitor. Owns the listen-only `CGEvent` tap and publishes press/release transitions. |
+| `GlobalPushToTalkShortcutMonitor.swift` | ~155 | System-wide push-to-talk monitor. Owns the listen-only `CGEvent` tap and publishes press/release transitions for push-to-talk and the live session shortcut. |
 | `ClaudeAPI.swift` | ~291 | Claude vision API client with streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |
 | `OpenAIAPI.swift` | ~142 | OpenAI GPT vision API client. |
 | `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client. Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. |
@@ -83,6 +94,8 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 open leanring-buddy.xcodeproj
 
 # Select the leanring-buddy scheme, set signing team, Cmd+R to build and run
+# Cmd+U runs the unit tests (leanring-buddyTests, Swift Testing). The shared
+# scheme in xcshareddata includes the test target.
 
 # Known non-blocking warnings: Swift 6 concurrency warnings,
 # deprecated onChange warning in OverlayWindow.swift. Do NOT attempt to fix these.

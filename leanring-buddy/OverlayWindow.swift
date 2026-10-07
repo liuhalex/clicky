@@ -85,6 +85,42 @@ struct NavigationBubbleSizePreferenceKey: PreferenceKey {
     }
 }
 
+struct LiveSessionStatusBubbleSizePreferenceKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
+
+/// A thin ring that slowly breathes around the buddy for as long as a live
+/// session is on. Its color shows the listening mode without any extra icons:
+/// blue in push-to-talk (mic off), orange in hands-free (mic on),
+/// matching the orange dot macOS shows when the microphone is in use.
+private struct LiveSessionIndicatorRingView: View {
+    let isHandsFreeListeningOn: Bool
+    private let pulseDurationSeconds: Double = 1.6
+
+    private var ringColor: Color {
+        isHandsFreeListeningOn ? DS.Colors.overlayHandsFreeOrange : DS.Colors.overlayCursorBlue
+    }
+
+    var body: some View {
+        TimelineView(.animation) { timelineContext in
+            let pulseProgress = timelineContext.date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: pulseDurationSeconds) / pulseDurationSeconds
+            // Breathes between 0 and 1 and back once per pulse
+            let breathAmount = (1 - cos(pulseProgress * 2 * .pi)) / 2
+
+            Circle()
+                .stroke(ringColor.opacity(0.85 - breathAmount * 0.45), lineWidth: 1.5)
+                .frame(width: 30, height: 30)
+                .scaleEffect(1.0 + breathAmount * 0.15)
+                .shadow(color: ringColor.opacity(0.6), radius: 4, x: 0, y: 0)
+                .animation(.easeInOut(duration: 0.4), value: isHandsFreeListeningOn)
+        }
+    }
+}
+
 /// The buddy's behavioral mode. Controls whether it follows the cursor,
 /// is flying toward a detected UI element, or is pointing at an element.
 enum BuddyNavigationMode {
@@ -157,6 +193,9 @@ struct BlueCursorView: View {
     /// an energetic "swooping" feel.
     @State private var buddyFlightScale: CGFloat = 1.0
 
+    /// Measured size of the live session status bubble, used to anchor its left edge beside the buddy.
+    @State private var liveSessionStatusBubbleSize: CGSize = .zero
+
     /// Scale factor for the navigation speech bubble's pop-in entrance.
     /// Starts at 0.5 and springs to 1.0 when the first character appears.
     @State private var navigationBubbleScale: CGFloat = 1.0
@@ -164,6 +203,33 @@ struct BlueCursorView: View {
     /// True when the buddy is flying BACK to the cursor after pointing.
     /// Only during the return flight can cursor movement cancel the animation.
     @State private var isReturningToCursor: Bool = false
+
+    /// Live session only: when the tracked element moves while the buddy is
+    /// flying to it, the flight steers toward this point instead of its
+    /// original destination, so the buddy never lands on a stale spot.
+    @State private var steeredFlightDestination: CGPoint?
+
+    /// Live session only: true while the buddy flies from the element's old
+    /// spot to its new one after the user scrolled or moved the window.
+    @State private var isFlyingToMovedTrackedElement: Bool = false
+
+    /// When the tracked element jumps farther than this (in points), for example
+    /// page down or the element re-found elsewhere, the buddy flies there along
+    /// its usual arc. Smaller moves (scrolling) are followed frame by frame so
+    /// the buddy stays anchored to the element.
+    private let minimumTrackedElementJumpDistanceToFly: CGFloat = 220
+
+    /// Fraction of the remaining distance to the tracked element the buddy
+    /// covers each 16ms frame while anchored. 0.5 keeps it ~25ms behind the
+    /// element, about the same delay as the app redrawing its scrolled content,
+    /// while still smoothing out small corrections from frame measurements.
+    private let anchoredFollowFractionPerFrame: CGFloat = 0.5
+
+    /// True whenever the bezier flight timer is moving the buddy frame by frame,
+    /// in which case SwiftUI's implicit position animations must be off.
+    private var isBuddyPositionDrivenByFlightTimer: Bool {
+        buddyNavigationMode == .navigatingToTarget || isFlyingToMovedTrackedElement
+    }
 
     // MARK: - Onboarding Video Layout
 
@@ -294,6 +360,55 @@ struct BlueCursorView: View {
                     }
             }
 
+            // Live session status — "live session on", "session ended", etc.
+            // Sits above the buddy so it never collides with the pointing bubble.
+            if buddyIsVisibleOnThisScreen, let liveSessionStatusBubbleText = companionManager.liveSessionStatusBubbleText {
+                Text(liveSessionStatusBubbleText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(DS.Colors.overlayCursorBlue)
+                            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.5), radius: 6, x: 0, y: 0)
+                    )
+                    .fixedSize()
+                    .overlay(
+                        GeometryReader { geo in
+                            Color.clear
+                                .preference(key: LiveSessionStatusBubbleSizePreferenceKey.self, value: geo.size)
+                        }
+                    )
+                    .position(x: cursorPosition.x + 10 + (liveSessionStatusBubbleSize.width / 2), y: cursorPosition.y - 28)
+                    .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
+                    .transition(.opacity)
+                    .onPreferenceChange(LiveSessionStatusBubbleSizePreferenceKey.self) { newSize in
+                        liveSessionStatusBubbleSize = newSize
+                    }
+            }
+
+            // Live session ring — a slow pulse around the buddy for as long as
+            // the session is on, so the user always knows Clicky is watching.
+            LiveSessionIndicatorRingView(
+                isHandsFreeListeningOn: companionManager.liveSessionListeningMode == .handsFree
+            )
+                .opacity(
+                    companionManager.isLiveSessionActive
+                        && buddyIsVisibleOnThisScreen
+                        && (companionManager.voiceState == .idle || companionManager.voiceState == .responding)
+                        ? cursorOpacity : 0
+                )
+                .position(cursorPosition)
+                .animation(
+                    buddyNavigationMode == .followingCursor
+                        ? .spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0)
+                        : nil,
+                    value: cursorPosition
+                )
+                .animation(.easeInOut(duration: 0.3), value: companionManager.isLiveSessionActive)
+                .allowsHitTesting(false)
+
             // Blue triangle cursor — shown when idle or while TTS is playing (responding).
             // All three states (triangle, waveform, spinner) stay in the view tree
             // permanently and cross-fade via opacity so SwiftUI doesn't remove/re-insert
@@ -318,7 +433,7 @@ struct BlueCursorView: View {
                 )
                 .animation(.easeIn(duration: 0.25), value: companionManager.voiceState)
                 .animation(
-                    buddyNavigationMode == .navigatingToTarget ? nil : .easeInOut(duration: 0.3),
+                    isBuddyPositionDrivenByFlightTimer ? nil : .easeInOut(duration: 0.3),
                     value: triangleRotationDegrees
                 )
 
@@ -384,6 +499,43 @@ struct BlueCursorView: View {
 
             startNavigatingToElement(screenLocation: screenLocation)
         }
+        .onChange(of: companionManager.liveTrackedElementScreenLocation) { _, newTrackedLocation in
+            guard let newTrackedLocation else {
+                // Tracking ended (element lost, clicked, or the session ended):
+                // hide the bubble and fly back to the cursor
+                guard buddyNavigationMode == .pointingAtTarget else { return }
+                navigationBubbleOpacity = 0.0
+                startFlyingBackToCursor()
+                return
+            }
+
+            // The element moved (the user scrolled or moved the window). Only the
+            // screen whose buddy is flying to or pointing at it reacts.
+            let newBuddyPointingPosition = buddyPointingPosition(forElementScreenLocation: newTrackedLocation)
+            switch buddyNavigationMode {
+            case .navigatingToTarget:
+                // Steer the flight that's heading to the element, never the return flight
+                if !isReturningToCursor {
+                    steeredFlightDestination = newBuddyPointingPosition
+                }
+            case .pointingAtTarget:
+                if isFlyingToMovedTrackedElement {
+                    steeredFlightDestination = newBuddyPointingPosition
+                } else {
+                    let jumpDistance = hypot(
+                        newBuddyPointingPosition.x - cursorPosition.x,
+                        newBuddyPointingPosition.y - cursorPosition.y
+                    )
+                    // Small moves are followed every frame by the cursor tracking
+                    // timer (anchored follow). Only big jumps get a flight.
+                    if jumpDistance >= minimumTrackedElementJumpDistanceToFly {
+                        startFlyingToMovedTrackedElement(buddyDestination: newBuddyPointingPosition)
+                    }
+                }
+            case .followingCursor:
+                break
+            }
+        }
     }
 
     /// Whether the buddy triangle should be visible on this screen.
@@ -429,7 +581,13 @@ struct BlueCursorView: View {
                 return
             }
 
-            // During forward navigation or pointing, just skip cursor tracking
+            // While pointing at a live-tracked element, stay anchored to it
+            if case .pointingAtTarget = self.buddyNavigationMode {
+                self.moveBuddyTowardTrackedElementForThisFrame()
+                return
+            }
+
+            // During forward navigation, just skip cursor tracking
             if self.buddyNavigationMode != .followingCursor {
                 return
             }
@@ -457,21 +615,7 @@ struct BlueCursorView: View {
         // Don't interrupt welcome animation
         guard !showWelcome || welcomeText.isEmpty else { return }
 
-        // Convert the AppKit screen location to SwiftUI coordinates for this screen
-        let targetInSwiftUI = convertScreenPointToSwiftUICoordinates(screenLocation)
-
-        // Offset the target so the buddy sits beside the element rather than
-        // directly on top of it — 8px to the right, 12px below.
-        let offsetTarget = CGPoint(
-            x: targetInSwiftUI.x + 8,
-            y: targetInSwiftUI.y + 12
-        )
-
-        // Clamp target to screen bounds with padding
-        let clampedTarget = CGPoint(
-            x: max(20, min(offsetTarget.x, screenFrame.width - 20)),
-            y: max(20, min(offsetTarget.y, screenFrame.height - 20))
-        )
+        let clampedTarget = buddyPointingPosition(forElementScreenLocation: screenLocation)
 
         // Record the current cursor position so we can detect if the user
         // moves the mouse enough to cancel the return flight
@@ -481,6 +625,8 @@ struct BlueCursorView: View {
         // Enter navigation mode — stop cursor following
         buddyNavigationMode = .navigatingToTarget
         isReturningToCursor = false
+        isFlyingToMovedTrackedElement = false
+        steeredFlightDestination = nil
 
         animateBezierFlightArc(to: clampedTarget) {
             guard self.buddyNavigationMode == .navigatingToTarget else { return }
@@ -488,10 +634,31 @@ struct BlueCursorView: View {
         }
     }
 
+    /// Where the buddy should sit to point at an element: converted to this
+    /// screen's SwiftUI coordinates, offset so the buddy sits beside the element
+    /// rather than directly on top of it (8px right, 12px below), and kept on screen.
+    private func buddyPointingPosition(forElementScreenLocation elementScreenLocation: CGPoint) -> CGPoint {
+        let elementInSwiftUI = convertScreenPointToSwiftUICoordinates(elementScreenLocation)
+
+        let offsetTarget = CGPoint(
+            x: elementInSwiftUI.x + 8,
+            y: elementInSwiftUI.y + 12
+        )
+
+        // Clamp target to screen bounds with padding
+        return CGPoint(
+            x: max(20, min(offsetTarget.x, screenFrame.width - 20)),
+            y: max(20, min(offsetTarget.y, screenFrame.height - 20))
+        )
+    }
+
     /// Animates the buddy along a quadratic bezier arc from its current position
     /// to the specified destination. The triangle rotates to face its direction
     /// of travel (tangent to the curve) each frame, scales up at the midpoint
     /// for a "swooping" feel, and the glow intensifies during flight.
+    ///
+    /// If `steeredFlightDestination` is set during the flight (live session
+    /// tracking), the arc bends toward that point on every frame instead.
     private func animateBezierFlightArc(
         to destination: CGPoint,
         onComplete: @escaping () -> Void
@@ -514,15 +681,23 @@ struct BlueCursorView: View {
 
         // Control point for the quadratic bezier arc. Offset the midpoint
         // upward (negative Y in SwiftUI) so the buddy flies in a parabolic arc.
-        let midPoint = CGPoint(
-            x: (startPosition.x + endPosition.x) / 2.0,
-            y: (startPosition.y + endPosition.y) / 2.0
-        )
-        let arcHeight = min(distance * 0.2, 80.0)
-        let controlPoint = CGPoint(x: midPoint.x, y: midPoint.y - arcHeight)
+        func arcControlPoint(towardEndPosition arcEndPosition: CGPoint) -> CGPoint {
+            let midPoint = CGPoint(
+                x: (startPosition.x + arcEndPosition.x) / 2.0,
+                y: (startPosition.y + arcEndPosition.y) / 2.0
+            )
+            let arcDistance = hypot(arcEndPosition.x - startPosition.x, arcEndPosition.y - startPosition.y)
+            let arcHeight = min(arcDistance * 0.2, 80.0)
+            return CGPoint(x: midPoint.x, y: midPoint.y - arcHeight)
+        }
 
         navigationAnimationTimer = Timer.scheduledTimer(withTimeInterval: frameInterval, repeats: true) { _ in
             currentFrame += 1
+
+            // Re-aim at the steered destination every frame so the buddy curves
+            // smoothly toward an element that moved mid-flight.
+            let endPosition = self.steeredFlightDestination ?? destination
+            let controlPoint = arcControlPoint(towardEndPosition: endPosition)
 
             if currentFrame > totalFrames {
                 self.navigationAnimationTimer?.invalidate()
@@ -592,8 +767,15 @@ struct BlueCursorView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
                 guard self.buddyNavigationMode == .pointingAtTarget else { return }
                 self.navigationBubbleOpacity = 0.0
+
+                // While a live session is tracking the element, keep pointing at it
+                // (the bubble fades but the buddy stays). The buddy flies back when
+                // tracking ends, via the liveTrackedElementScreenLocation observer.
+                guard self.companionManager.liveTrackedElementScreenLocation == nil else { return }
+
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     guard self.buddyNavigationMode == .pointingAtTarget else { return }
+                    guard self.companionManager.liveTrackedElementScreenLocation == nil else { return }
                     self.startFlyingBackToCursor()
                 }
             }
@@ -631,6 +813,45 @@ struct BlueCursorView: View {
         }
     }
 
+    /// Live session: the element the buddy is pointing at jumped far away (page
+    /// down, or re-found elsewhere), so fly to its new spot along the same arc as
+    /// any other flight. Stays in pointing mode so the speech bubble keeps going.
+    /// If the element keeps moving, the flight is steered mid-air, and after
+    /// landing the anchored follow takes over again.
+    private func startFlyingToMovedTrackedElement(buddyDestination: CGPoint) {
+        isFlyingToMovedTrackedElement = true
+        steeredFlightDestination = buddyDestination
+
+        animateBezierFlightArc(to: buddyDestination) {
+            self.isFlyingToMovedTrackedElement = false
+            self.steeredFlightDestination = nil
+            guard self.buddyNavigationMode == .pointingAtTarget else { return }
+
+            // Back to the pointing pose after facing the direction of travel
+            self.triangleRotationDegrees = -35.0
+        }
+    }
+
+    /// Live session: called every 16ms while pointing. Moves the buddy most of
+    /// the way to the tracked element's current estimate, which moves with every
+    /// scroll event, so the buddy appears attached to the element.
+    private func moveBuddyTowardTrackedElementForThisFrame() {
+        guard !isFlyingToMovedTrackedElement,
+              let liveTrackedElementScreenLocation = companionManager.liveTrackedElementScreenLocation else {
+            return
+        }
+
+        let anchoredBuddyPosition = buddyPointingPosition(forElementScreenLocation: liveTrackedElementScreenLocation)
+        let remainingDeltaX = anchoredBuddyPosition.x - cursorPosition.x
+        let remainingDeltaY = anchoredBuddyPosition.y - cursorPosition.y
+        guard hypot(remainingDeltaX, remainingDeltaY) > 0.25 else { return }
+
+        cursorPosition = CGPoint(
+            x: cursorPosition.x + remainingDeltaX * anchoredFollowFractionPerFrame,
+            y: cursorPosition.y + remainingDeltaY * anchoredFollowFractionPerFrame
+        )
+    }
+
     /// Flies the buddy back to the current cursor position after pointing is done.
     private func startFlyingBackToCursor() {
         let mouseLocation = NSEvent.mouseLocation
@@ -641,6 +862,8 @@ struct BlueCursorView: View {
 
         buddyNavigationMode = .navigatingToTarget
         isReturningToCursor = true
+        isFlyingToMovedTrackedElement = false
+        steeredFlightDestination = nil
 
         animateBezierFlightArc(to: cursorWithTrackingOffset) {
             self.finishNavigationAndResumeFollowing()
@@ -664,12 +887,14 @@ struct BlueCursorView: View {
         navigationAnimationTimer = nil
         buddyNavigationMode = .followingCursor
         isReturningToCursor = false
+        isFlyingToMovedTrackedElement = false
+        steeredFlightDestination = nil
         triangleRotationDegrees = -35.0
         buddyFlightScale = 1.0
         navigationBubbleText = ""
         navigationBubbleOpacity = 0.0
         navigationBubbleScale = 1.0
-        companionManager.clearDetectedElementLocation()
+        companionManager.handleBuddyReturnedToCursor()
     }
 
     // MARK: - Welcome Animation

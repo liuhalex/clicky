@@ -14,6 +14,15 @@ import Foundation
 
 final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     let shortcutTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
+    /// Press/release of the fn + control live session shortcut. Shares this
+    /// event tap so the app only needs one system-wide keyboard listener.
+    let liveSessionShortcutTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
+    /// Fires when command is double tapped, which switches a live session
+    /// between push-to-talk and hands-free. (Not option: double-tapping
+    /// option is a common shortcut for opening other apps, such as Claude.)
+    let commandDoubleTapPublisher = PassthroughSubject<Void, Never>()
+    /// Mutated only from the CGEvent tap callback (main thread).
+    private var commandDoubleTapDetector = ModifierKeyDoubleTapDetector(tappedModifierFlag: .command)
 
     private var globalEventTap: CFMachPort?
     private var globalEventTapRunLoopSource: CFRunLoopSource?
@@ -22,6 +31,8 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// Published so the overlay can hide immediately on key release without
     /// waiting for the async dictation state pipeline to catch up.
     @Published private(set) var isShortcutCurrentlyPressed = false
+    /// Mutated only from the CGEvent tap callback (main thread), like isShortcutCurrentlyPressed.
+    private var isLiveSessionShortcutCurrentlyPressed = false
 
     deinit {
         stop()
@@ -85,6 +96,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
 
     func stop() {
         isShortcutCurrentlyPressed = false
+        isLiveSessionShortcutCurrentlyPressed = false
 
         if let globalEventTapRunLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), globalEventTapRunLoopSource, .commonModes)
@@ -125,6 +137,40 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         case .released:
             isShortcutCurrentlyPressed = false
             shortcutTransitionPublisher.send(.released)
+        }
+
+        // CGEvent timestamps use different units across Mac hardware, so time
+        // the taps with the system uptime clock at the moment the event arrives.
+        let eventArrivalTimestamp = ProcessInfo.processInfo.systemUptime
+        if eventType == .flagsChanged {
+            let deviceIndependentModifierFlags = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue))
+                .intersection(.deviceIndependentFlagsMask)
+            let didDoubleTapCommand = commandDoubleTapDetector.handleModifierFlagsChanged(
+                modifierFlags: deviceIndependentModifierFlags,
+                timestamp: eventArrivalTimestamp
+            )
+            if didDoubleTapCommand {
+                commandDoubleTapPublisher.send()
+            }
+        } else if eventType == .keyDown {
+            commandDoubleTapDetector.handleKeyPressed()
+        }
+
+        let liveSessionShortcutTransition = LiveSessionToggleShortcut.shortcutTransition(
+            for: eventType,
+            modifierFlagsRawValue: event.flags.rawValue,
+            wasShortcutPreviouslyPressed: isLiveSessionShortcutCurrentlyPressed
+        )
+
+        switch liveSessionShortcutTransition {
+        case .none:
+            break
+        case .pressed:
+            isLiveSessionShortcutCurrentlyPressed = true
+            liveSessionShortcutTransitionPublisher.send(.pressed)
+        case .released:
+            isLiveSessionShortcutCurrentlyPressed = false
+            liveSessionShortcutTransitionPublisher.send(.released)
         }
 
         return Unmanaged.passUnretained(event)

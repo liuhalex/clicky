@@ -21,6 +21,17 @@ enum CompanionVoiceState {
     case responding
 }
 
+/// How the user talks to Clicky during a live session. Double tapping
+/// command switches between the two.
+enum LiveSessionListeningMode {
+    /// Hold ctrl + option to talk. The microphone is off otherwise.
+    case pushToTalk
+    /// Just start talking, no keys needed: Clicky picks up a question when the
+    /// user speaks and sends it once they stop. Speech is transcribed on this
+    /// Mac, so nothing leaves it until a question is sent. Good for tutoring.
+    case handsFree
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
@@ -41,6 +52,23 @@ final class CompanionManager: ObservableObject {
     /// Custom speech bubble text for the pointing animation. When set,
     /// BlueCursorView uses this instead of a random pointer phrase.
     @Published var detectedElementBubbleText: String?
+
+    // MARK: - Live Session State
+
+    /// True while a live session is on (toggled by holding fn + control).
+    /// During a session Clicky watches the screen continuously and keeps
+    /// pointing at an element as it moves.
+    @Published private(set) var isLiveSessionActive = false
+    /// Short status message shown next to the cursor ("live session on",
+    /// "session ended", ...). Nil when no message is showing.
+    @Published private(set) var liveSessionStatusBubbleText: String?
+    /// Where the element Claude pointed at is right now (global AppKit coords),
+    /// updated as the user scrolls or moves the window. Nil when nothing is
+    /// being tracked. BlueCursorView moves the pointing buddy to follow it.
+    @Published private(set) var liveTrackedElementScreenLocation: CGPoint?
+    /// Every session starts in push-to-talk. Hands-free is opt-in (double tap
+    /// command) because an open microphone is the bigger ask.
+    @Published private(set) var liveSessionListeningMode: LiveSessionListeningMode = .pushToTalk
 
     // MARK: - Onboarding Video State (shared across all screen overlays)
 
@@ -96,6 +124,119 @@ final class CompanionManager: ObservableObject {
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
+
+    /// How long fn + control must be held to start or end a live session.
+    /// Long enough that brushing the keys doesn't toggle it by accident.
+    private static let liveSessionToggleHoldDurationSeconds: Double = 0.6
+    /// If the tracked element can't be found for this long (scrolled away,
+    /// covered, page changed), the buddy stops pointing and comes back.
+    private static let liveTrackedElementLostAfterSeconds: Double = 0.6
+    /// A click this close (in points) to the tracked element counts as the
+    /// user clicking it, which ends the pointing.
+    private static let liveTrackedElementClickDismissRadiusInPoints: CGFloat = 60
+
+    private var liveSessionShortcutTransitionCancellable: AnyCancellable?
+    private var commandDoubleTapCancellable: AnyCancellable?
+    private var pendingLiveSessionToggleTask: Task<Void, Never>?
+    /// Prevents a second toggle while the screen stream is still starting or stopping.
+    private var isLiveSessionStartingOrStopping = false
+    private var liveSessionScreenWatcher: LiveSessionScreenWatcher?
+    /// Started when the tracked element goes missing; fires the "lost" handling
+    /// unless the element is found again first.
+    private var liveTrackedElementLostTask: Task<Void, Never>?
+    /// Claude's short label for the tracked element (e.g. "save button"), used
+    /// when telling the user where it went.
+    private var liveTrackedElementLabel: String?
+    /// Where the tracked element was heading the last time it went missing.
+    /// Updated on every missed frame so the announcement uses the latest motion.
+    private var liveTrackedElementLastSeenPosition: TrackedElementLastSeenPosition?
+    /// Speaks "it scrolled off the top…" once any answer finishes playing.
+    /// Cancelled when the user starts a new push-to-talk.
+    private var lostTrackedElementAnnouncementTask: Task<Void, Never>?
+    /// True from when the lost-element announcement starts playing until it
+    /// finishes, so it can be cut short if the user scrolls the element back.
+    private var isLostTrackedElementAnnouncementSpeaking = false
+
+    /// After the tracked element is lost, keep looking for it this long. If the
+    /// user scrolls back to it, the buddy flies back and points at it again.
+    private static let lostTrackedElementSearchDurationSeconds: Double = 20
+    /// True while the element is lost but still being looked for. The buddy
+    /// isn't pointing, but the tracker and scroll estimate keep running.
+    private var isSearchingForLostTrackedElement = false
+    private var lostTrackedElementSearchStartedDate = Date.distantPast
+    private var liveSessionStatusBubbleHideTask: Task<Void, Never>?
+    private var liveSessionMouseClickMonitor: Any?
+    /// Watches trackpad / scroll wheel events during a session so the buddy
+    /// moves with scrolled content instantly instead of waiting for frames.
+    private var liveSessionScrollWheelMonitor: Any?
+    /// Combines instant scroll events with frame measurements into where the
+    /// tracked element is right now. Nil when nothing is being tracked.
+    private var liveTrackedElementPositionEstimator: TrackedElementPositionEstimator?
+    /// The display the tracked element is on. Scrolling on another display
+    /// can't move it, so those scroll events are ignored.
+    private var liveTrackedElementDisplayFrame: CGRect?
+
+    /// Like Clicky outside a session, the buddy points at an element while
+    /// explaining it, then lets go. It holds on for this long after Clicky
+    /// stops talking, and scrolling restarts the countdown so the buddy stays
+    /// with the element while the user is still looking for it.
+    private static let liveTrackedElementHoldAfterActivitySeconds: Double = 4
+    /// Last time Clicky talked about the tracked element or the user scrolled.
+    private var liveTrackedElementLastActivityDate = Date.distantPast
+
+    /// Checks every 100ms during a session: runs hands-free listening, lets go
+    /// of the tracked element after the explanation, and ends idle sessions.
+    private var liveSessionSupervisorTask: Task<Void, Never>?
+    /// A session nobody talks to for this long ends itself, so the screen
+    /// stream and microphone never stay on forgotten in the background.
+    private static let liveSessionAutoEndAfterIdleSeconds: Double = 10 * 60
+    /// Last time the user asked something (or started talking) in this session.
+    private var liveSessionLastActivityDate = Date.distantPast
+    /// How many questions went to Claude this session, shown when it ends so
+    /// the user can see exactly what the session cost.
+    private var liveSessionQuestionCount = 0
+
+    // MARK: - Hands-Free Listening State
+
+    /// After words have been heard, this much silence (no transcript changes)
+    /// ends the question and sends it.
+    private static let handsFreeSilenceSecondsToEndUtterance: Double = 1.2
+    /// Speech recognition sessions have time limits, so a listening session
+    /// that hears nothing for this long is quietly restarted.
+    private static let handsFreeListeningRestartAfterSecondsWithoutSpeech: Double = 50
+    /// Shorter transcripts ("hm", "okay") are background noise or filler, not
+    /// questions, and are never sent to Claude.
+    private static let handsFreeMinimumWordCountToSend = 2
+
+    /// True while the microphone is listening hands-free (started by the
+    /// session, not by push-to-talk). Shares BuddyDictationManager with push-to-talk.
+    private var isHandsFreeDictationActive = false
+    private var isHandsFreeDictationStarting = false
+    /// Becomes true once the transcript has words in it. Until then the buddy
+    /// shows normally instead of the listening waveform.
+    private var hasHandsFreeListeningHeardSpeech = false
+    private var handsFreeDictationStartedDate = Date.distantPast
+    private var handsFreeLastSeenTranscript = ""
+    private var handsFreeLastTranscriptChangeDate = Date.distantPast
+    /// Backs off retries if listening fails to start (for example, dictation turned off).
+    private var handsFreeNextStartAllowedDate = Date.distantPast
+    /// When words were first heard in the current hands-free utterance (system
+    /// uptime, the same clock the computer audio transcript uses).
+    private var handsFreeSpeechStartedSystemUptime: TimeInterval = 0
+    /// Transcribes what the Mac itself is playing so hands-free mode can tell
+    /// the user's voice apart from a video or podcast coming out of the speakers.
+    private var computerAudioSpeechTranscriber: ComputerAudioSpeechTranscriber?
+    /// How far before the user started talking to look in the computer audio
+    /// transcript, since the microphone picks up the speakers with a small delay
+    /// and recognition of the two streams finishes at slightly different times.
+    private static let computerAudioEchoLookbackSeconds: TimeInterval = 4
+
+    /// True from the moment a transcript is sent to Claude until the answer
+    /// finishes or fails. Hands-free listening stays paused meanwhile so it
+    /// never hears Clicky's own voice. The generation number keeps a cancelled,
+    /// superseded answer from clearing the flag of the newer one.
+    private var isResponsePipelineRunning = false
+    private var responsePipelineGeneration = 0
 
     /// True when all three required permissions (accessibility, screen recording,
     /// microphone) are granted. Used by the panel to show a single "all good" state.
@@ -179,6 +320,8 @@ final class CompanionManager: ObservableObject {
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
+        bindLiveSessionShortcutTransitions()
+        bindCommandDoubleTap()
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
@@ -281,13 +424,37 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// Called by the overlay when the buddy finishes flying back to the cursor.
+    /// Clears the pointing target, but a lost live-session element keeps being
+    /// searched for so the buddy can return if the user scrolls back to it.
+    func handleBuddyReturnedToCursor() {
+        detectedElementScreenLocation = nil
+        detectedElementDisplayFrame = nil
+        detectedElementBubbleText = nil
+        if !isSearchingForLostTrackedElement {
+            stopLiveElementTracking()
+        }
+    }
+
     func clearDetectedElementLocation() {
         detectedElementScreenLocation = nil
         detectedElementDisplayFrame = nil
         detectedElementBubbleText = nil
+        stopLiveElementTracking()
     }
 
     func stop() {
+        if isLiveSessionActive {
+            let liveSessionScreenWatcherToStop = liveSessionScreenWatcher
+            Task { await liveSessionScreenWatcherToStop?.stop() }
+        }
+        liveSessionShortcutTransitionCancellable?.cancel()
+        commandDoubleTapCancellable?.cancel()
+        pendingLiveSessionToggleTask?.cancel()
+        liveSessionSupervisorTask?.cancel()
+        removeLiveSessionMouseClickMonitor()
+        removeLiveSessionScrollWheelMonitor()
+
         globalPushToTalkShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
@@ -440,6 +607,14 @@ final class CompanionManager: ObservableObject {
                 // manages that state directly until streaming finishes.
                 guard self.voiceState != .responding else { return }
 
+                // Hands-free listening runs quietly in the background. Keep the
+                // normal buddy (not the waveform or spinner) until the user
+                // actually starts talking; the supervisor switches to .listening then.
+                if self.isHandsFreeDictationActive && !self.hasHandsFreeListeningHeardSpeech {
+                    self.voiceState = .idle
+                    return
+                }
+
                 if isFinalizing {
                     self.voiceState = .processing
                 } else if isRecording {
@@ -473,6 +648,11 @@ final class CompanionManager: ObservableObject {
     private func handleShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
+            // In a live session the microphone may already be listening hands-free.
+            // Push-to-talk still works and takes over the microphone.
+            if isHandsFreeDictationActive {
+                cancelHandsFreeDictation()
+            }
             guard !buddyDictationManager.isDictationInProgress else { return }
             // Don't register push-to-talk while the onboarding video is playing
             guard !showOnboardingVideo else { return }
@@ -493,6 +673,8 @@ final class CompanionManager: ObservableObject {
 
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
+            lostTrackedElementAnnouncementTask?.cancel()
+            lostTrackedElementAnnouncementTask = nil
             elevenLabsTTSClient.stopPlayback()
             clearDetectedElementLocation()
 
@@ -576,6 +758,18 @@ final class CompanionManager: ObservableObject {
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
     """
 
+    /// Added to the system prompt only for hands-free questions. With the
+    /// microphone open, Clicky overhears things that aren't meant for it (a
+    /// conversation with someone else, a call, a video). Claude is much better
+    /// than any keyword rule at telling those apart from a real question.
+    private static let handsFreeOverheardSpeechInstructions = """
+    hands-free mode:
+    the microphone is open, so this may not have been said to you. the user might be talking to someone else, on a call, reading something aloud, thinking out loud, or it might be audio from a video. only respond if the user is clearly talking to you — asking you something, or continuing your conversation. if they're not, reply with exactly [SILENT] and nothing else. never comment on what's on screen unless the user asked.
+    """
+
+    /// The exact reply Claude gives when hands-free speech wasn't meant for Clicky.
+    private static let overheardSpeechSilentReply = "[SILENT]"
+
     // MARK: - AI Response Pipeline
 
     /// Captures a screenshot, sends it along with the transcript to Claude,
@@ -583,17 +777,46 @@ final class CompanionManager: ObservableObject {
     /// the spinner/processing state until TTS audio begins playing.
     /// Claude's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
-    private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
+    /// `wasHeardHandsFree` is true when the transcript came from hands-free
+    /// listening rather than push-to-talk, so it may not have been meant for Clicky.
+    private func sendTranscriptToClaudeWithScreenshot(transcript: String, wasHeardHandsFree: Bool = false) {
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
 
+        responsePipelineGeneration += 1
+        let thisResponsePipelineGeneration = responsePipelineGeneration
+        isResponsePipelineRunning = true
+        isLostTrackedElementAnnouncementSpeaking = false
+
+        if isLiveSessionActive {
+            liveSessionQuestionCount += 1
+            liveSessionLastActivityDate = Date()
+        }
+
         currentResponseTask = Task {
+            defer {
+                if responsePipelineGeneration == thisResponsePipelineGeneration {
+                    isResponsePipelineRunning = false
+                }
+            }
+
             // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
 
             do {
-                // Capture all connected screens so the AI has full context
-                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                // During a live session, use the frames the stream already has
+                // (no screenshot delay) and remember which frame each image came
+                // from, so tracking starts on the exact image Claude saw.
+                // Otherwise capture all connected screens so the AI has full context.
+                let screenCaptures: [CompanionScreenCapture]
+                var liveFramesSentToClaude: [LiveScreenFrame] = []
+                if isLiveSessionActive,
+                   let latestLiveCaptures = liveSessionScreenWatcher?.makeScreenCapturesFromLatestFrames() {
+                    screenCaptures = latestLiveCaptures.screenCaptures
+                    liveFramesSentToClaude = latestLiveCaptures.framesInSameOrder
+                } else {
+                    screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                }
 
                 guard !Task.isCancelled else { return }
 
@@ -612,7 +835,9 @@ final class CompanionManager: ObservableObject {
 
                 let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
                     images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
+                    systemPrompt: wasHeardHandsFree
+                        ? Self.companionVoiceResponseSystemPrompt + "\n\n" + Self.handsFreeOverheardSpeechInstructions
+                        : Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
                     onTextChunk: { _ in
@@ -621,6 +846,16 @@ final class CompanionManager: ObservableObject {
                 )
 
                 guard !Task.isCancelled else { return }
+
+                // Overheard speech that wasn't meant for Clicky: say nothing,
+                // point at nothing, and keep it out of the conversation history.
+                if wasHeardHandsFree
+                    && fullResponseText.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix(Self.overheardSpeechSilentReply) {
+                    print("🤫 Hands-free: \"\(transcript)\" wasn't meant for Clicky, staying quiet")
+                    voiceState = .idle
+                    scheduleTransientHideIfNeeded()
+                    return
+                }
 
                 // Parse the [POINT:...] tag from Claude's response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
@@ -637,45 +872,59 @@ final class CompanionManager: ObservableObject {
 
                 // Pick the screen capture matching Claude's screen number,
                 // falling back to the cursor screen if not specified.
-                let targetScreenCapture: CompanionScreenCapture? = {
+                let targetScreenCaptureIndex: Int? = {
                     if let screenNumber = parseResult.screenNumber,
                        screenNumber >= 1 && screenNumber <= screenCaptures.count {
-                        return screenCaptures[screenNumber - 1]
+                        return screenNumber - 1
                     }
-                    return screenCaptures.first(where: { $0.isCursorScreen })
+                    return screenCaptures.firstIndex(where: { $0.isCursorScreen })
                 }()
+                let targetScreenCapture = targetScreenCaptureIndex.map { screenCaptures[$0] }
 
                 if let pointCoordinate = parseResult.coordinate,
                    let targetScreenCapture {
-                    // Claude's coordinates are in the screenshot's pixel space
-                    // (top-left origin, e.g. 1280x831). Scale to the display's
-                    // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
-                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
-                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
-                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
-                    let displayFrame = targetScreenCapture.displayFrame
-
                     // Clamp to screenshot coordinate space
-                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-
-                    // Scale from screenshot pixels to display points
-                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
-                    let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
-                    let globalLocation = CGPoint(
-                        x: displayLocalX + displayFrame.origin.x,
-                        y: appKitY + displayFrame.origin.y
+                    let clampedScreenshotPixelLocation = CGPoint(
+                        x: max(0, min(pointCoordinate.x, CGFloat(targetScreenCapture.screenshotWidthInPixels))),
+                        y: max(0, min(pointCoordinate.y, CGFloat(targetScreenCapture.screenshotHeightInPixels)))
                     )
 
+                    let globalLocation = Self.convertScreenshotPixelLocationToGlobalScreenLocation(
+                        screenshotPixelLocation: clampedScreenshotPixelLocation,
+                        screenshotWidthInPixels: targetScreenCapture.screenshotWidthInPixels,
+                        screenshotHeightInPixels: targetScreenCapture.screenshotHeightInPixels,
+                        displayWidthInPoints: targetScreenCapture.displayWidthInPoints,
+                        displayHeightInPoints: targetScreenCapture.displayHeightInPoints,
+                        displayFrame: targetScreenCapture.displayFrame
+                    )
+
+                    // In a live session, keep following the element as the screen
+                    // changes. Start tracking before publishing the location so the
+                    // first tracking update can't arrive before the buddy takes off.
+                    if let targetScreenCaptureIndex,
+                       targetScreenCaptureIndex < liveFramesSentToClaude.count {
+                        startLiveElementTracking(
+                            referenceFrame: liveFramesSentToClaude[targetScreenCaptureIndex],
+                            targetLocationInScreenshotPixels: clampedScreenshotPixelLocation,
+                            initialGlobalLocation: globalLocation,
+                            elementLabel: parseResult.elementLabel
+                        )
+                    }
+
                     detectedElementScreenLocation = globalLocation
-                    detectedElementDisplayFrame = displayFrame
+                    detectedElementDisplayFrame = targetScreenCapture.displayFrame
                     ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
+                    #if DEBUG
+                    PointingDebugRecorder.recordPointing(
+                        screenshotImageData: targetScreenCapture.imageData,
+                        screenshotLabel: targetScreenCapture.label,
+                        pointInScreenshotPixels: clampedScreenshotPixelLocation,
+                        elementLabel: parseResult.elementLabel,
+                        userTranscript: transcript,
+                        claudeResponseText: fullResponseText,
+                        isLiveSessionActive: isLiveSessionActive
+                    )
+                    #endif
                     print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
                 } else {
                     print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
@@ -730,7 +979,9 @@ final class CompanionManager: ObservableObject {
     /// fades out the overlay after a 1-second pause. Cancelled automatically
     /// if the user starts another push-to-talk interaction.
     private func scheduleTransientHideIfNeeded() {
-        guard !isClickyCursorEnabled && isOverlayVisible else { return }
+        // During a live session the buddy stays on screen the whole time,
+        // even when "Show Clicky" is off. Ending the session schedules the hide.
+        guard !isClickyCursorEnabled && isOverlayVisible && !isLiveSessionActive else { return }
 
         transientHideTask?.cancel()
         transientHideTask = Task {
@@ -763,6 +1014,707 @@ final class CompanionManager: ObservableObject {
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding
+    }
+
+    // MARK: - Live Session
+
+    private func bindLiveSessionShortcutTransitions() {
+        liveSessionShortcutTransitionCancellable = globalPushToTalkShortcutMonitor
+            .liveSessionShortcutTransitionPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] transition in
+                self?.handleLiveSessionShortcutTransition(transition)
+            }
+    }
+
+    /// The session only toggles after fn + control has been held for
+    /// liveSessionToggleHoldDurationSeconds. Releasing earlier cancels it.
+    private func handleLiveSessionShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
+        switch transition {
+        case .pressed:
+            pendingLiveSessionToggleTask?.cancel()
+            pendingLiveSessionToggleTask = Task {
+                try? await Task.sleep(nanoseconds: UInt64(Self.liveSessionToggleHoldDurationSeconds * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                await toggleLiveSession()
+            }
+        case .released:
+            pendingLiveSessionToggleTask?.cancel()
+            pendingLiveSessionToggleTask = nil
+        case .none:
+            break
+        }
+    }
+
+    func toggleLiveSession() async {
+        if isLiveSessionActive {
+            await endLiveSession()
+        } else {
+            await startLiveSession()
+        }
+    }
+
+    private func startLiveSession() async {
+        guard !isLiveSessionActive, !isLiveSessionStartingOrStopping else { return }
+        // Same conditions as push-to-talk: not during the onboarding video,
+        // and the screen stream needs Screen Recording permission.
+        guard !showOnboardingVideo, allPermissionsGranted else { return }
+
+        isLiveSessionStartingOrStopping = true
+        defer { isLiveSessionStartingOrStopping = false }
+
+        // If "Show Clicky" is off, bring the buddy on screen for the whole session
+        transientHideTask?.cancel()
+        transientHideTask = nil
+        if !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+
+        let newLiveSessionScreenWatcher = LiveSessionScreenWatcher()
+        let newComputerAudioSpeechTranscriber = ComputerAudioSpeechTranscriber()
+        newLiveSessionScreenWatcher.onComputerAudioBuffer = { computerAudioBuffer in
+            newComputerAudioSpeechTranscriber.appendComputerAudioBuffer(computerAudioBuffer)
+        }
+        newLiveSessionScreenWatcher.onElementTrackingUpdate = { [weak self] trackingUpdate in
+            Task { @MainActor [weak self] in
+                self?.handleLiveElementTrackingUpdate(trackingUpdate)
+            }
+        }
+        newLiveSessionScreenWatcher.onStreamStoppedUnexpectedly = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.endLiveSession(statusMessage: "live session stopped")
+            }
+        }
+
+        do {
+            try await newLiveSessionScreenWatcher.start()
+        } catch {
+            print("⚠️ Live session: couldn't start screen stream: \(error)")
+            showLiveSessionStatusBubble("couldn't start live session")
+            scheduleTransientHideIfNeeded()
+            return
+        }
+
+        liveSessionScreenWatcher = newLiveSessionScreenWatcher
+        computerAudioSpeechTranscriber = newComputerAudioSpeechTranscriber
+        isLiveSessionActive = true
+        installLiveSessionMouseClickMonitor()
+        installLiveSessionScrollWheelMonitor()
+        liveSessionQuestionCount = 0
+        liveSessionLastActivityDate = Date()
+        liveSessionListeningMode = .pushToTalk
+        startLiveSessionSupervisor()
+        showLiveSessionStatusBubble("live session on · hold ctrl + option to talk · double-tap command to go hands-free")
+        print("🔴 Live session started")
+    }
+
+    /// `statusMessage` overrides the default end-of-session summary.
+    private func endLiveSession(statusMessage: String? = nil) async {
+        guard isLiveSessionActive, !isLiveSessionStartingOrStopping else { return }
+
+        isLiveSessionStartingOrStopping = true
+        defer { isLiveSessionStartingOrStopping = false }
+
+        liveSessionSupervisorTask?.cancel()
+        liveSessionSupervisorTask = nil
+        if isHandsFreeDictationActive {
+            cancelHandsFreeDictation()
+        }
+
+        // If the buddy is pointing at a tracked element, this sends it back to the cursor
+        stopLiveElementTracking()
+        removeLiveSessionMouseClickMonitor()
+        removeLiveSessionScrollWheelMonitor()
+
+        let liveSessionScreenWatcherToStop = liveSessionScreenWatcher
+        liveSessionScreenWatcher = nil
+        computerAudioSpeechTranscriber?.setTranscriptionEnabled(false)
+        computerAudioSpeechTranscriber = nil
+        isLiveSessionActive = false
+        await liveSessionScreenWatcherToStop?.stop()
+
+        let questionCountSummary = liveSessionQuestionCount == 1
+            ? "1 question sent"
+            : "\(liveSessionQuestionCount) questions sent"
+        showLiveSessionStatusBubble(statusMessage ?? "session ended · \(questionCountSummary)")
+        print("⚪️ Live session ended (\(questionCountSummary))")
+        scheduleTransientHideIfNeeded()
+    }
+
+    private func startLiveElementTracking(
+        referenceFrame: LiveScreenFrame,
+        targetLocationInScreenshotPixels: CGPoint,
+        initialGlobalLocation: CGPoint,
+        elementLabel: String?
+    ) {
+        guard let liveSessionScreenWatcher else { return }
+
+        let didStartTracking = liveSessionScreenWatcher.startTrackingElement(
+            referenceFrame: referenceFrame,
+            targetLocationInScreenshotPixels: targetLocationInScreenshotPixels
+        )
+        guard didStartTracking else {
+            // The area is too plain to recognize again (for example, empty
+            // background). The buddy still points, just without following.
+            print("🎯 Live session: element area too plain to track, pointing without following")
+            return
+        }
+
+        liveTrackedElementLostTask?.cancel()
+        liveTrackedElementLostTask = nil
+        liveTrackedElementLabel = elementLabel
+        liveTrackedElementLastSeenPosition = nil
+        liveTrackedElementDisplayFrame = referenceFrame.displayFrame
+        liveTrackedElementPositionEstimator = TrackedElementPositionEstimator(
+            initialScreenLocation: initialGlobalLocation,
+            frameCaptureTimestamp: referenceFrame.captureTimestamp
+        )
+        liveTrackedElementScreenLocation = initialGlobalLocation
+        liveTrackedElementLastActivityDate = Date()
+
+        let referenceFrameAgeInMilliseconds = Int((ProcessInfo.processInfo.systemUptime - referenceFrame.captureTimestamp) * 1000)
+        print("🎯 Live session: tracking \"\(elementLabel ?? "element")\" (reference frame is \(referenceFrameAgeInMilliseconds)ms old)")
+    }
+
+    private func stopLiveElementTracking() {
+        if let liveTrackedElementPositionEstimator {
+            print("🎯 Live session: stopped tracking (learned scroll scale \(String(format: "%.2f", liveTrackedElementPositionEstimator.scrollToScreenMovementScale)))")
+        }
+        liveSessionScreenWatcher?.stopTrackingElement()
+        liveTrackedElementLostTask?.cancel()
+        liveTrackedElementLostTask = nil
+        liveTrackedElementLabel = nil
+        liveTrackedElementLastSeenPosition = nil
+        liveTrackedElementPositionEstimator = nil
+        liveTrackedElementDisplayFrame = nil
+        isSearchingForLostTrackedElement = false
+        if liveTrackedElementScreenLocation != nil {
+            liveTrackedElementScreenLocation = nil
+        }
+    }
+
+    private func handleLiveElementTrackingUpdate(_ trackingUpdate: LiveSessionElementTrackingUpdate) {
+        // Ignore updates that were already in flight when tracking stopped
+        guard liveTrackedElementScreenLocation != nil || isSearchingForLostTrackedElement else { return }
+
+        switch trackingUpdate {
+        case .targetFound(let targetLocationInScreenshotPixels, let frame):
+            liveTrackedElementLostTask?.cancel()
+            liveTrackedElementLostTask = nil
+            let measuredScreenLocation = Self.convertScreenshotPixelLocationToGlobalScreenLocation(
+                screenshotPixelLocation: targetLocationInScreenshotPixels,
+                screenshotWidthInPixels: frame.cgImage.width,
+                screenshotHeightInPixels: frame.cgImage.height,
+                displayWidthInPoints: Int(frame.displayFrame.width),
+                displayHeightInPoints: Int(frame.displayFrame.height),
+                displayFrame: frame.displayFrame
+            )
+            #if DEBUG
+            if let previousEstimate = liveTrackedElementPositionEstimator?.estimatedScreenLocation {
+                let jumpDistance = hypot(measuredScreenLocation.x - previousEstimate.x, measuredScreenLocation.y - previousEstimate.y)
+                if jumpDistance >= TrackedElementPositionEstimator.correctionDistanceAppliedInFull {
+                    print("🐞 Tracking: frame match is \(Int(jumpDistance))pt from the scroll estimate (scroll scale \(String(format: "%.2f", liveTrackedElementPositionEstimator?.scrollToScreenMovementScale ?? 0)))")
+                }
+            }
+            #endif
+
+            // The frame is slightly old by now; the estimator adds any scrolling
+            // since it was captured so the buddy doesn't get pulled backwards.
+            liveTrackedElementPositionEstimator?.applyTrackingMeasurement(
+                measuredScreenLocation: measuredScreenLocation,
+                frameCaptureTimestamp: frame.captureTimestamp
+            )
+            let estimatedScreenLocation = liveTrackedElementPositionEstimator?.estimatedScreenLocation ?? measuredScreenLocation
+            if isSearchingForLostTrackedElement {
+                handleLostTrackedElementFoundAgain(atScreenLocation: estimatedScreenLocation, displayFrame: frame.displayFrame)
+            } else {
+                liveTrackedElementScreenLocation = estimatedScreenLocation
+            }
+        case .targetNotFoundInThisFrame(let lastKnownTargetLocation, let lastObservedTargetMovement, let frameWidthInPixels, let frameHeightInPixels):
+            // Already lost and announced; keep searching quietly
+            guard !isSearchingForLostTrackedElement else { return }
+
+            liveTrackedElementLastSeenPosition = TrackedElementLastSeenPosition.determine(
+                lastKnownTargetLocationInScreenshotPixels: lastKnownTargetLocation,
+                lastObservedTargetMovementInScreenshotPixels: lastObservedTargetMovement,
+                frameWidthInPixels: frameWidthInPixels,
+                frameHeightInPixels: frameHeightInPixels
+            )
+
+            // One missed frame is normal mid-scroll. Only give up if the element
+            // stays missing. A timer (instead of counting frames) also covers the
+            // case where the screen stops changing, so no more frames arrive.
+            guard liveTrackedElementLostTask == nil else { return }
+            liveTrackedElementLostTask = Task {
+                try? await Task.sleep(nanoseconds: UInt64(Self.liveTrackedElementLostAfterSeconds * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                liveTrackedElementLostTask = nil
+                handleLiveTrackedElementLost()
+            }
+        }
+    }
+
+    /// The tracked element has been missing long enough to give up. The buddy
+    /// flies back to the cursor, and Clicky tells the user where it went.
+    private func handleLiveTrackedElementLost() {
+        // The scroll-driven estimate knows best when the element was scrolled
+        // off-screen (the tracker can lose it a few frames before it leaves).
+        var lastSeenPositionFromScrollEstimate: TrackedElementLastSeenPosition? = nil
+        if let liveTrackedElementPositionEstimator, let liveTrackedElementDisplayFrame {
+            lastSeenPositionFromScrollEstimate = TrackedElementLastSeenPosition.fromEstimatedScreenLocation(
+                liveTrackedElementPositionEstimator.estimatedScreenLocation,
+                displayFrame: liveTrackedElementDisplayFrame
+            )
+        }
+        let lastSeenPosition = lastSeenPositionFromScrollEstimate
+            ?? liveTrackedElementLastSeenPosition
+            ?? .disappearedWhileOnScreen(screenAreaDescription: "middle")
+        let lostElementLabel = liveTrackedElementLabel
+        print("🎯 Live session: lost track of the element (\(lastSeenPosition))")
+
+        // Only speak up when the user scrolled it away (they're probably still
+        // looking for it). If it vanished because they switched pages, tabs, or
+        // apps, they moved on on purpose: quietly stop pointing, say nothing.
+        if case .disappearedWhileOnScreen = lastSeenPosition {
+            stopLiveElementTracking()
+            return
+        }
+
+        // Stop pointing (the buddy flies back to the cursor), but keep the tracker
+        // looking for the element in case the user scrolls back to it.
+        isSearchingForLostTrackedElement = true
+        lostTrackedElementSearchStartedDate = Date()
+        liveTrackedElementScreenLocation = nil
+
+        showLiveSessionStatusBubble(lastSeenPosition.statusBubbleText)
+        speakLostTrackedElementAnnouncement(lastSeenPosition.spokenAnnouncement(elementLabel: lostElementLabel))
+    }
+
+    /// The user scrolled the lost element back into view: stop telling them
+    /// where it went, and fly back to point at it again.
+    private func handleLostTrackedElementFoundAgain(atScreenLocation elementScreenLocation: CGPoint, displayFrame: CGRect) {
+        print("🎯 Live session: found the element again")
+        isSearchingForLostTrackedElement = false
+
+        lostTrackedElementAnnouncementTask?.cancel()
+        lostTrackedElementAnnouncementTask = nil
+        if isLostTrackedElementAnnouncementSpeaking {
+            elevenLabsTTSClient.stopPlayback()
+            isLostTrackedElementAnnouncementSpeaking = false
+        }
+        liveSessionStatusBubbleHideTask?.cancel()
+        liveSessionStatusBubbleText = nil
+
+        liveTrackedElementLastActivityDate = Date()
+        liveTrackedElementScreenLocation = elementScreenLocation
+
+        // The display frame must be set before the location: the overlay reads
+        // it when the location changes to decide which screen flies.
+        detectedElementBubbleText = "there it is!"
+        detectedElementDisplayFrame = displayFrame
+        detectedElementScreenLocation = elementScreenLocation
+    }
+
+    private func speakLostTrackedElementAnnouncement(_ announcementText: String) {
+        lostTrackedElementAnnouncementTask?.cancel()
+        lostTrackedElementAnnouncementTask = Task {
+            // The user often scrolls while Clicky is still answering. Let the
+            // answer finish instead of talking over it.
+            while elevenLabsTTSClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled else { return }
+            }
+
+            // Don't talk while the user is asking something new
+            guard !Task.isCancelled, voiceState == .idle || voiceState == .responding else { return }
+
+            isLostTrackedElementAnnouncementSpeaking = true
+            do {
+                try await elevenLabsTTSClient.speakText(announcementText)
+            } catch {
+                isLostTrackedElementAnnouncementSpeaking = false
+                print("⚠️ Live session: couldn't speak lost-element announcement: \(error)")
+            }
+
+            // speakText returns once playback starts. Clearing the task lets the
+            // supervisor notice when the audio ends. A replaced announcement is
+            // always cancelled first, so it can't clear its replacement.
+            if !Task.isCancelled {
+                lostTrackedElementAnnouncementTask = nil
+            }
+        }
+    }
+
+    // MARK: - Listening Mode
+
+    private func bindCommandDoubleTap() {
+        commandDoubleTapCancellable = globalPushToTalkShortcutMonitor
+            .commandDoubleTapPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                self?.toggleLiveSessionListeningMode()
+            }
+    }
+
+    /// Double tapping command switches between push-to-talk and hands-free.
+    /// Only meaningful during a live session.
+    func toggleLiveSessionListeningMode() {
+        guard isLiveSessionActive else { return }
+
+        switch liveSessionListeningMode {
+        case .pushToTalk:
+            liveSessionListeningMode = .handsFree
+            computerAudioSpeechTranscriber?.setTranscriptionEnabled(true)
+            showLiveSessionStatusBubble("hands-free · just start talking")
+        case .handsFree:
+            liveSessionListeningMode = .pushToTalk
+            computerAudioSpeechTranscriber?.setTranscriptionEnabled(false)
+            if isHandsFreeDictationActive {
+                cancelHandsFreeDictation()
+            }
+            showLiveSessionStatusBubble("push to talk · hold ctrl + option")
+        }
+        print("🎙️ Live session listening mode: \(liveSessionListeningMode)")
+    }
+
+    // MARK: - Live Session Supervisor
+
+    private func startLiveSessionSupervisor() {
+        liveSessionSupervisorTask?.cancel()
+        liveSessionSupervisorTask = Task {
+            while !Task.isCancelled && isLiveSessionActive {
+                superviseHandsFreeListening()
+                releaseTrackedElementIfExplanationIsOver()
+                stopSearchingForLostTrackedElementIfTimedOut()
+                endLiveSessionIfIdleTooLong()
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+    }
+
+    /// Keeps the microphone listening whenever Clicky is free, pauses it
+    /// while Clicky thinks or talks (so it never hears itself), and sends a
+    /// question once the user stops talking.
+    private func superviseHandsFreeListening() {
+        if isLostTrackedElementAnnouncementSpeaking
+            && lostTrackedElementAnnouncementTask == nil
+            && !elevenLabsTTSClient.isPlaying {
+            isLostTrackedElementAnnouncementSpeaking = false
+        }
+
+        guard liveSessionListeningMode == .handsFree else {
+            if isHandsFreeDictationActive {
+                cancelHandsFreeDictation()
+            }
+            return
+        }
+
+        let isClickyThinkingOrTalking = isResponsePipelineRunning || elevenLabsTTSClient.isPlaying
+        let isPushToTalkInUse = globalPushToTalkShortcutMonitor.isShortcutCurrentlyPressed
+            || (buddyDictationManager.isDictationInProgress && !isHandsFreeDictationActive)
+        let now = Date()
+
+        if isHandsFreeDictationActive {
+            // The dictation manager went idle: the question was sent, or listening failed
+            if !buddyDictationManager.isDictationInProgress && !isHandsFreeDictationStarting {
+                let listeningDurationSeconds = now.timeIntervalSince(handsFreeDictationStartedDate)
+                let didListeningFailRightAway = !hasHandsFreeListeningHeardSpeech && listeningDurationSeconds < 2
+                handsFreeNextStartAllowedDate = now.addingTimeInterval(didListeningFailRightAway ? 5 : 0.3)
+                isHandsFreeDictationActive = false
+                hasHandsFreeListeningHeardSpeech = false
+                return
+            }
+
+            if isClickyThinkingOrTalking {
+                cancelHandsFreeDictation()
+                return
+            }
+
+            // Still starting up, or already finalizing the transcript
+            guard buddyDictationManager.isRecordingFromKeyboardShortcut else { return }
+
+            let currentTranscript = buddyDictationManager.latestRecognizedText
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if currentTranscript != handsFreeLastSeenTranscript {
+                handsFreeLastSeenTranscript = currentTranscript
+                handsFreeLastTranscriptChangeDate = now
+
+                if !currentTranscript.isEmpty && !hasHandsFreeListeningHeardSpeech {
+                    handsFreeSpeechStartedSystemUptime = ProcessInfo.processInfo.systemUptime
+                }
+
+                // The microphone may be hearing the Mac's own speakers (a video,
+                // a podcast). Drop it quietly as soon as it's clear, before the
+                // waveform shows or anything is sent.
+                if isHeardSpeechAnEchoOfComputerAudio(currentTranscript) {
+                    print("🎙️ Hands-free: ignored sound from this Mac: \"\(currentTranscript)\"")
+                    cancelHandsFreeDictation()
+                    return
+                }
+
+                if !currentTranscript.isEmpty && !hasHandsFreeListeningHeardSpeech {
+                    hasHandsFreeListeningHeardSpeech = true
+                    liveSessionLastActivityDate = now
+                    voiceState = .listening
+                }
+            }
+
+            if hasHandsFreeListeningHeardSpeech
+                && now.timeIntervalSince(handsFreeLastTranscriptChangeDate) >= Self.handsFreeSilenceSecondsToEndUtterance {
+                // The user stopped talking. Stopping finalizes the transcript and
+                // sends it through handleHandsFreeUtterance.
+                print("🎙️ Hands-free: utterance ended")
+                buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            } else if !hasHandsFreeListeningHeardSpeech
+                && now.timeIntervalSince(handsFreeDictationStartedDate) >= Self.handsFreeListeningRestartAfterSecondsWithoutSpeech {
+                // Quietly restart before the recognizer's session time limit
+                cancelHandsFreeDictation()
+            }
+            return
+        }
+
+        guard !isClickyThinkingOrTalking,
+              !isPushToTalkInUse,
+              !buddyDictationManager.isDictationInProgress,
+              !showOnboardingVideo,
+              now >= handsFreeNextStartAllowedDate else {
+            return
+        }
+        startHandsFreeDictation()
+    }
+
+    private func startHandsFreeDictation() {
+        isHandsFreeDictationActive = true
+        isHandsFreeDictationStarting = true
+        hasHandsFreeListeningHeardSpeech = false
+        handsFreeLastSeenTranscript = ""
+        handsFreeDictationStartedDate = Date()
+
+        Task {
+            await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
+                currentDraftText: "",
+                updateDraftText: { _ in
+                    // Partial transcripts are hidden (waveform-only UI)
+                },
+                submitDraftText: { [weak self] finalTranscript in
+                    self?.handleHandsFreeUtterance(finalTranscript)
+                }
+            )
+            isHandsFreeDictationStarting = false
+        }
+    }
+
+    private func isHeardSpeechAnEchoOfComputerAudio(_ heardText: String) -> Bool {
+        guard let computerAudioSpeechTranscriber else { return false }
+        let lookbackStartSystemUptime = (hasHandsFreeListeningHeardSpeech
+            ? handsFreeSpeechStartedSystemUptime
+            : ProcessInfo.processInfo.systemUptime) - Self.computerAudioEchoLookbackSeconds
+        let recentComputerAudioText = computerAudioSpeechTranscriber.computerAudioText(
+            sinceSystemUptime: lookbackStartSystemUptime
+        )
+        return ComputerAudioEchoDetector.isLikelyEchoOfComputerAudio(
+            heardText: heardText,
+            computerAudioText: recentComputerAudioText
+        )
+    }
+
+    private func cancelHandsFreeDictation() {
+        buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
+        isHandsFreeDictationActive = false
+        hasHandsFreeListeningHeardSpeech = false
+        if voiceState == .listening {
+            voiceState = .idle
+        }
+    }
+
+    private func handleHandsFreeUtterance(_ finalTranscript: String) {
+        let wordCount = finalTranscript.split(whereSeparator: { $0.isWhitespace }).count
+        guard wordCount >= Self.handsFreeMinimumWordCountToSend else {
+            print("🎙️ Hands-free: ignored \"\(finalTranscript)\" (too short to be a question, not sent)")
+            return
+        }
+        // Final check: the Mac's audio transcript may have caught up since the
+        // last partial transcript was compared.
+        guard !isHeardSpeechAnEchoOfComputerAudio(finalTranscript) else {
+            print("🎙️ Hands-free: ignored sound from this Mac: \"\(finalTranscript)\" (not sent)")
+            return
+        }
+
+        #if DEBUG
+        if let computerAudioSpeechTranscriber {
+            let recentComputerAudioText = computerAudioSpeechTranscriber.computerAudioText(
+                sinceSystemUptime: handsFreeSpeechStartedSystemUptime - Self.computerAudioEchoLookbackSeconds
+            )
+            if !recentComputerAudioText.isEmpty {
+                print("🐞 Hands-free: sending even though the Mac was playing: \"\(recentComputerAudioText)\"")
+            }
+        }
+        #endif
+
+        lastTranscript = finalTranscript
+        print("🗣️ Companion received transcript (hands-free): \(finalTranscript)")
+        ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
+
+        // Same as pressing push-to-talk: stop pointing at the previous answer's element
+        clearDetectedElementLocation()
+        sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript, wasHeardHandsFree: true)
+    }
+
+    /// The buddy keeps pointing at the tracked element while Clicky explains
+    /// it, then lets go a few seconds after Clicky stops talking (scrolling
+    /// restarts the countdown).
+    private func releaseTrackedElementIfExplanationIsOver() {
+        guard liveTrackedElementScreenLocation != nil else { return }
+
+        let now = Date()
+        if isResponsePipelineRunning || elevenLabsTTSClient.isPlaying {
+            liveTrackedElementLastActivityDate = now
+            return
+        }
+
+        if now.timeIntervalSince(liveTrackedElementLastActivityDate) >= Self.liveTrackedElementHoldAfterActivitySeconds {
+            print("🎯 Live session: explanation finished, done pointing")
+            stopLiveElementTracking()
+        }
+    }
+
+    private func stopSearchingForLostTrackedElementIfTimedOut() {
+        guard isSearchingForLostTrackedElement,
+              Date().timeIntervalSince(lostTrackedElementSearchStartedDate) >= Self.lostTrackedElementSearchDurationSeconds else {
+            return
+        }
+        print("🎯 Live session: stopped looking for the lost element")
+        stopLiveElementTracking()
+    }
+
+    private func endLiveSessionIfIdleTooLong() {
+        guard !isResponsePipelineRunning,
+              !elevenLabsTTSClient.isPlaying,
+              !hasHandsFreeListeningHeardSpeech,
+              Date().timeIntervalSince(liveSessionLastActivityDate) >= Self.liveSessionAutoEndAfterIdleSeconds else {
+            return
+        }
+        Task {
+            await endLiveSession(statusMessage: "session ended after 10 quiet minutes")
+        }
+    }
+
+    /// Clicking the element the buddy is pointing at means the user found it,
+    /// so the buddy stops pointing and returns to the cursor.
+    private func installLiveSessionMouseClickMonitor() {
+        removeLiveSessionMouseClickMonitor()
+        liveSessionMouseClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
+            // Global event monitors are always called on the main thread
+            MainActor.assumeIsolated {
+                self?.handleLiveSessionMouseClick(atScreenLocation: NSEvent.mouseLocation)
+            }
+        }
+    }
+
+    private func removeLiveSessionMouseClickMonitor() {
+        if let liveSessionMouseClickMonitor {
+            NSEvent.removeMonitor(liveSessionMouseClickMonitor)
+            self.liveSessionMouseClickMonitor = nil
+        }
+    }
+
+    private func installLiveSessionScrollWheelMonitor() {
+        removeLiveSessionScrollWheelMonitor()
+        liveSessionScrollWheelMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] scrollEvent in
+            // Global event monitors are always called on the main thread
+            MainActor.assumeIsolated {
+                self?.handleLiveSessionScrollWheelEvent(scrollEvent)
+            }
+        }
+    }
+
+    private func removeLiveSessionScrollWheelMonitor() {
+        if let liveSessionScrollWheelMonitor {
+            NSEvent.removeMonitor(liveSessionScrollWheelMonitor)
+            self.liveSessionScrollWheelMonitor = nil
+        }
+    }
+
+    /// Moves the tracked element's estimate with the scrolled content right
+    /// away, so the buddy stays anchored instead of catching up every frame.
+    private func handleLiveSessionScrollWheelEvent(_ scrollEvent: NSEvent) {
+        guard liveTrackedElementPositionEstimator != nil,
+              let liveTrackedElementDisplayFrame,
+              liveTrackedElementDisplayFrame.contains(NSEvent.mouseLocation) else {
+            return
+        }
+
+        // The user is still looking for the element: keep pointing at it
+        liveTrackedElementLastActivityDate = Date()
+
+        // Trackpads and Magic Mice report exact point distances. Classic mouse
+        // wheels report "lines" that each app scrolls by a different amount,
+        // so for those the buddy follows the screen frames alone.
+        guard scrollEvent.hasPreciseScrollingDeltas else { return }
+
+        liveTrackedElementPositionEstimator?.applyScrollWheelMovement(
+            scrollingDeltaX: scrollEvent.scrollingDeltaX,
+            scrollingDeltaY: scrollEvent.scrollingDeltaY,
+            timestamp: scrollEvent.timestamp
+        )
+        liveTrackedElementScreenLocation = liveTrackedElementPositionEstimator?.estimatedScreenLocation
+    }
+
+    private func handleLiveSessionMouseClick(atScreenLocation clickScreenLocation: CGPoint) {
+        guard let liveTrackedElementScreenLocation else { return }
+
+        let distanceFromTrackedElement = hypot(
+            clickScreenLocation.x - liveTrackedElementScreenLocation.x,
+            clickScreenLocation.y - liveTrackedElementScreenLocation.y
+        )
+        if distanceFromTrackedElement <= Self.liveTrackedElementClickDismissRadiusInPoints {
+            stopLiveElementTracking()
+        }
+    }
+
+    private func showLiveSessionStatusBubble(_ statusText: String) {
+        liveSessionStatusBubbleHideTask?.cancel()
+        liveSessionStatusBubbleText = statusText
+        // Longer messages stay up longer so they can actually be read
+        let displayDurationSeconds = max(1.8, Double(statusText.count) * 0.07)
+        liveSessionStatusBubbleHideTask = Task {
+            try? await Task.sleep(nanoseconds: UInt64(displayDurationSeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            liveSessionStatusBubbleText = nil
+        }
+    }
+
+    // MARK: - Screenshot Coordinate Conversion
+
+    /// Claude's coordinates (and tracked element positions) are in the
+    /// screenshot's pixel space (top-left origin, e.g. 1280x831). Scales them to
+    /// the display's point space (e.g. 1512x982), then converts to AppKit global
+    /// coordinates (bottom-left origin) that the overlay windows use.
+    nonisolated static func convertScreenshotPixelLocationToGlobalScreenLocation(
+        screenshotPixelLocation: CGPoint,
+        screenshotWidthInPixels: Int,
+        screenshotHeightInPixels: Int,
+        displayWidthInPoints: Int,
+        displayHeightInPoints: Int,
+        displayFrame: CGRect
+    ) -> CGPoint {
+        let displayWidth = CGFloat(displayWidthInPoints)
+        let displayHeight = CGFloat(displayHeightInPoints)
+
+        // Scale from screenshot pixels to display points
+        let displayLocalX = screenshotPixelLocation.x * (displayWidth / CGFloat(screenshotWidthInPixels))
+        let displayLocalY = screenshotPixelLocation.y * (displayHeight / CGFloat(screenshotHeightInPixels))
+
+        // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
+        let appKitY = displayHeight - displayLocalY
+
+        // Convert display-local coords to global screen coords
+        return CGPoint(
+            x: displayLocalX + displayFrame.origin.x,
+            y: appKitY + displayFrame.origin.y
+        )
     }
 
     // MARK: - Point Tag Parsing

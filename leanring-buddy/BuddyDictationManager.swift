@@ -268,7 +268,9 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     private var activeStartSource: BuddyDictationStartSource?
     private var draftCallbacks: BuddyDictationDraftCallbacks?
     private var draftTextBeforeCurrentDictation = ""
-    private var latestRecognizedText = ""
+    /// Read by CompanionManager's hands-free listening to detect when the user
+    /// starts and stops talking (the transcript stops changing).
+    private(set) var latestRecognizedText = ""
     private var shouldAutomaticallySubmitFinalDraft = false
     private var hasFinishedCurrentDictationSession = false
     private var finalizeFallbackWorkItem: DispatchWorkItem?

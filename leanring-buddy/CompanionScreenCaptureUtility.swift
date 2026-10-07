@@ -81,15 +81,9 @@ enum CompanionScreenCaptureUtility {
             let filter = SCContentFilter(display: display, excludingWindows: ownAppWindows)
 
             let configuration = SCStreamConfiguration()
-            let maxDimension = 1280
-            let aspectRatio = CGFloat(display.width) / CGFloat(display.height)
-            if display.width >= display.height {
-                configuration.width = maxDimension
-                configuration.height = Int(CGFloat(maxDimension) / aspectRatio)
-            } else {
-                configuration.height = maxDimension
-                configuration.width = Int(CGFloat(maxDimension) * aspectRatio)
-            }
+            let screenshotDimensions = screenshotDimensionsInPixels(forDisplayWidth: display.width, displayHeight: display.height)
+            configuration.width = screenshotDimensions.widthInPixels
+            configuration.height = screenshotDimensions.heightInPixels
 
             let cgImage = try await SCScreenshotManager.captureImage(
                 contentFilter: filter,
@@ -101,14 +95,11 @@ enum CompanionScreenCaptureUtility {
                 continue
             }
 
-            let screenLabel: String
-            if sortedDisplays.count == 1 {
-                screenLabel = "user's screen (cursor is here)"
-            } else if isCursorScreen {
-                screenLabel = "screen \(displayIndex + 1) of \(sortedDisplays.count) — cursor is on this screen (primary focus)"
-            } else {
-                screenLabel = "screen \(displayIndex + 1) of \(sortedDisplays.count) — secondary screen"
-            }
+            let screenLabel = screenLabelForClaude(
+                displayIndex: displayIndex,
+                displayCount: sortedDisplays.count,
+                isCursorScreen: isCursorScreen
+            )
 
             capturedScreens.append(CompanionScreenCapture(
                 imageData: jpegData,
@@ -128,5 +119,33 @@ enum CompanionScreenCaptureUtility {
         }
 
         return capturedScreens
+    }
+
+    /// Screenshots are capped at 1280px on the longest side to keep the
+    /// Claude request small. Shared with the live session stream so both
+    /// produce images Claude sees at the same size.
+    nonisolated static func screenshotDimensionsInPixels(
+        forDisplayWidth displayWidth: Int,
+        displayHeight: Int
+    ) -> (widthInPixels: Int, heightInPixels: Int) {
+        let maxDimension = 1280
+        let aspectRatio = CGFloat(displayWidth) / CGFloat(displayHeight)
+        if displayWidth >= displayHeight {
+            return (maxDimension, Int(CGFloat(maxDimension) / aspectRatio))
+        } else {
+            return (Int(CGFloat(maxDimension) * aspectRatio), maxDimension)
+        }
+    }
+
+    /// The text label attached to each screen image so Claude knows which
+    /// screen the cursor is on and which screen number to use in [POINT:...:screenN].
+    nonisolated static func screenLabelForClaude(displayIndex: Int, displayCount: Int, isCursorScreen: Bool) -> String {
+        if displayCount == 1 {
+            return "user's screen (cursor is here)"
+        } else if isCursorScreen {
+            return "screen \(displayIndex + 1) of \(displayCount) — cursor is on this screen (primary focus)"
+        } else {
+            return "screen \(displayIndex + 1) of \(displayCount) — secondary screen"
+        }
     }
 }

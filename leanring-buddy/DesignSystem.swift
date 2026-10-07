@@ -143,6 +143,11 @@ enum DS {
         /// (screen overlay vs in-app UI).
         static let overlayCursorBlue = Color(hex: "#3380FF")
 
+        /// Live session ring color in hands-free mode (microphone on).
+        /// Matches the orange dot macOS shows when an app is using the
+        /// microphone, so the meaning is already familiar.
+        static let overlayHandsFreeOrange = Color(hex: "#FF9F0A")
+
         // ── Floating Button Gradient ─────────────────────────────────
 
         /// The floating session button gradient colors (unchanged from original —
