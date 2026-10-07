@@ -6,3 +6,9 @@ build/
 releases/
 .claude/
 coding-plans/
+
+# Debug-build pointing snapshots (contain screenshots of your screen)
+.pointing-debug/
+
+# Local Cloudflare Worker dev state (wrangler dev)
+worker/.wrangler/
