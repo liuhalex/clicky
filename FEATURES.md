@@ -4,6 +4,8 @@ Notes on what I'm building on top of the open-source Clicky repo
 (github.com/farzaa/clicky). Some features recreate things the newest
 HeyClicky has that aren't in this repo; others are new ideas.
 
+The short version for reviewers is [PITCH.md](PITCH.md).
+
 *Last updated: 2026-10-07 (first commit on `feature/live-session`).*
 
 **Origin key**
@@ -27,7 +29,7 @@ HeyClicky has that aren't in this repo; others are new ideas.
 | [Point while explaining, then let go](#point-while-explaining-then-let-go) | ❓ | Built |
 | ["It scrolled off the top" voice announcement](#lost-element-announcement) | New | Built, tried |
 | [Re-find when scrolled back ("there it is!")](#re-find-when-scrolled-back) | New | Built |
-| [Two listening modes: push-to-talk and hands-free](#listening-modes) | ❓ | Built, tried (Mac-audio filter not yet confirmed) |
+| [Two listening modes: push-to-talk and hands-free](#listening-modes) | New | Built, tried (Mac-audio filter not yet confirmed) |
 | [Mode ring: blue vs orange](#mode-ring) | New | Built |
 | [Token-anxiety design](#token-anxiety-design) | New | Built |
 | [Point and draw while talking](#point-and-draw-while-talking) | ❓ | Planned |
@@ -40,7 +42,7 @@ Also see [Improvements and Bug Fixes](#improvements-and-bug-fixes) for everythin
 ---
 
 ## Live Session
-**Origin:** New · **Status:** Built, tried
+**Origin:** New (confirmed: HeyClicky has no continuous screen watching) · **Status:** Built, tried
 
 - **Problem:** Clicky takes one screenshot when you release the push-to-talk keys. If you scroll afterward, it points at where the element *used* to be.
 - **What it does:** hold **fn + control** for ~0.6s to start a session, and again to end it. During a session Clicky watches the screen continuously, so questions use what's on screen *right now*.
@@ -109,7 +111,7 @@ Also see [Improvements and Bug Fixes](#improvements-and-bug-fixes) for everythin
 - Only an unmistakable match counts, so a look-alike can't trigger it.
 
 ## Listening Modes
-**Origin:** ❓ · **Status:** Built, tried (Mac-audio filter not yet confirmed)
+**Origin:** New (confirmed: HeyClicky has no hands-free mode) · **Status:** Built, tried (Mac-audio filter not yet confirmed)
 
 - **Push-to-talk** (the default): hold ctrl + option.
 - **Hands-free:** just start talking, no keys needed. Clicky picks up your question when you speak and sends it once you've gone 1.2s without new words. It's meant for tutoring-style sessions.
