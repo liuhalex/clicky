@@ -21,6 +21,18 @@ enum CompanionVoiceState {
     case responding
 }
 
+/// One line in the conversation transcript (opened from the menu bar panel).
+struct ConversationTranscriptEntry: Identifiable, Equatable {
+    enum Speaker {
+        case user
+        case clicky
+    }
+
+    let id = UUID()
+    let speaker: Speaker
+    let text: String
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
@@ -55,6 +67,17 @@ final class CompanionManager: ObservableObject {
     /// updated as the user scrolls or moves the window. Nil when nothing is
     /// being tracked. BlueCursorView moves the pointing buddy to follow it.
     @Published private(set) var liveTrackedElementScreenLocation: CGPoint?
+    /// The line Clicky is saying right now, shown in the blue bubble beside its cursor.
+    /// Stays a few seconds after Clicky finishes, then becomes nil.
+    @Published private(set) var spokenCaptionText: String?
+    /// User preference for showing captions of what Clicky says. On by
+    /// default (it helps people who miss spoken words), persisted to UserDefaults.
+    @Published private(set) var areCaptionsEnabled: Bool = UserDefaults.standard.object(forKey: "areCaptionsEnabled") == nil
+        ? true
+        : UserDefaults.standard.bool(forKey: "areCaptionsEnabled")
+    /// The conversation so far (questions Clicky answered and what it said),
+    /// shown in the transcript window (opened from the menu bar panel).
+    @Published private(set) var conversationTranscriptEntries: [ConversationTranscriptEntry] = []
 
     // MARK: - Onboarding Video State (shared across all screen overlays)
 
@@ -91,7 +114,10 @@ final class CompanionManager: ObservableObject {
     }()
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
-        return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
+        return ElevenLabsTTSClient(
+            proxyURL: "\(Self.workerBaseURL)/tts",
+            timedSpeechProxyURL: "\(Self.workerBaseURL)/tts-with-timestamps"
+        )
     }()
 
     /// Conversation history so Claude remembers prior exchanges within a session.
@@ -103,6 +129,18 @@ final class CompanionManager: ObservableObject {
     private var currentResponseTask: Task<Void, Never>?
 
     private var shortcutTransitionCancellable: AnyCancellable?
+    /// Advances the caption sentence by sentence while audio plays.
+    private var spokenCaptionTask: Task<Void, Never>?
+    /// Each caption appears this much before its first word is spoken, so it's
+    /// already there as the words begin (subtitles do the same).
+    private static let spokenCaptionLeadSeconds: Double = 0.1
+    /// The last caption stays up this long after Clicky stops talking, so
+    /// there's time to read it.
+    private static let spokenCaptionLingerSeconds: Double = 4
+    /// Keeps the transcript from growing forever.
+    private static let maximumConversationTranscriptEntryCount = 100
+    /// The scrollable conversation transcript, opened from the menu bar panel.
+    private var conversationTranscriptPanelManager: ConversationTranscriptPanelManager?
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
@@ -122,6 +160,7 @@ final class CompanionManager: ObservableObject {
     private static let liveTrackedElementClickDismissRadiusInPoints: CGFloat = 60
 
     private var liveSessionShortcutTransitionCancellable: AnyCancellable?
+    private var captionsToggleShortcutCancellable: AnyCancellable?
     private var pendingLiveSessionToggleTask: Task<Void, Never>?
     /// Prevents a second toggle while the screen stream is still starting or stopping.
     private var isLiveSessionStartingOrStopping = false
@@ -220,12 +259,44 @@ final class CompanionManager: ObservableObject {
     /// and recognition of the two streams finishes at slightly different times.
     private static let computerAudioEchoLookbackSeconds: TimeInterval = 4
 
+    // Talking over Clicky: hands-free listening continues while Clicky thinks
+    // and talks, so the user can interrupt it (see ClickySpeechInterruptionDetector).
+
+    /// True if Clicky talked during this listening session, so the microphone
+    /// transcript contains Clicky's own voice.
+    private var handsFreeDictationOverlappedClickySpeech = false
+    /// What Clicky had said when the user started talking over it. Removed
+    /// from the final transcript so only the user's words are sent.
+    private var handsFreeClickySpeechTextToRemoveFromTranscript: String?
+    /// The question Clicky was still thinking about when the user kept
+    /// talking. It's sent again together with the new words.
+    private var handsFreeQuestionInterruptedWhileThinking: String?
+    /// The user's own words heard while Clicky thinks or talks (Clicky's voice
+    /// removed), from the latest transcript.
+    private var handsFreeUsersOwnWordsHeardOverClicky: [String] = []
+    /// A possible interruption and when it was first heard. Speech recognition
+    /// revises its guesses as more audio arrives ("gi" → "get" → "github"), so
+    /// a bit of Clicky's own voice can briefly look like the user's words.
+    /// Clicky only reacts once they've lasted this long.
+    private var handsFreePendingInterruption: (response: ClickySpeechInterruptionDetector.InterruptionResponse, firstHeardDate: Date)?
+    private static let handsFreeInterruptionMustLastSeconds: Double = 0.3
+
     /// True from the moment a transcript is sent to Claude until the answer
     /// finishes or fails. Hands-free listening stays paused meanwhile so it
     /// never hears Clicky's own voice. The generation number keeps a cancelled,
     /// superseded answer from clearing the flag of the newer one.
     private var isResponsePipelineRunning = false
     private var responsePipelineGeneration = 0
+
+    /// Splits the answer Claude is writing into pieces Clicky can start
+    /// speaking right away. Reset for every question.
+    private var answerSpeechSegmenter = StreamingSpeechSegmenter()
+    private var hasAnswerSpeechBegun = false
+    /// Waits for the answer's first audio, then switches from the spinner to
+    /// talking and starts captions.
+    private var answerSpeechStartWaitTask: Task<Void, Never>?
+    /// The question Claude is answering right now.
+    private var transcriptOfQuestionBeingAnswered = ""
 
     /// True when all three required permissions (accessibility, screen recording,
     /// microphone) are granted. Used by the panel to show a single "all good" state.
@@ -310,6 +381,13 @@ final class CompanionManager: ObservableObject {
         bindAudioPowerLevel()
         bindShortcutTransitions()
         bindLiveSessionShortcutTransitions()
+        captionsToggleShortcutCancellable = globalPushToTalkShortcutMonitor.captionsToggleShortcutPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                guard let self else { return }
+                self.setCaptionsEnabledAndConfirm(!self.areCaptionsEnabled)
+            }
+        conversationTranscriptPanelManager = ConversationTranscriptPanelManager(companionManager: self)
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
@@ -436,6 +514,7 @@ final class CompanionManager: ObservableObject {
             Task { await liveSessionScreenWatcherToStop.stop() }
         }
         liveSessionShortcutTransitionCancellable?.cancel()
+        captionsToggleShortcutCancellable?.cancel()
         pendingLiveSessionToggleTask?.cancel()
         liveSessionSupervisorTask?.cancel()
         removeLiveSessionMouseClickMonitor()
@@ -597,7 +676,11 @@ final class CompanionManager: ObservableObject {
                 // normal buddy (not the waveform or spinner) until the user
                 // actually starts talking; the supervisor switches to .listening then.
                 if self.isHandsFreeDictationActive && !self.hasHandsFreeListeningHeardSpeech {
-                    self.voiceState = .idle
+                    // Listening also continues while Clicky thinks (so the user
+                    // can talk over it). Keep the spinner showing meanwhile.
+                    if !self.isResponsePipelineRunning {
+                        self.voiceState = .idle
+                    }
                     return
                 }
 
@@ -686,10 +769,13 @@ final class CompanionManager: ObservableObject {
                         // Partial transcripts are hidden (waveform-only UI)
                     },
                     submitDraftText: { [weak self] finalTranscript in
-                        self?.lastTranscript = finalTranscript
+                        guard let self else { return }
+                        self.lastTranscript = finalTranscript
                         print("🗣️ Companion received transcript: \(finalTranscript)")
+                        if self.replayLastAnswerIfAsked(finalTranscript) { return }
+                        if self.handleCaptionsVoiceCommandIfAsked(finalTranscript) { return }
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        self.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
                     }
                 )
             }
@@ -773,6 +859,13 @@ final class CompanionManager: ObservableObject {
         let thisResponsePipelineGeneration = responsePipelineGeneration
         isResponsePipelineRunning = true
         isLostTrackedElementAnnouncementSpeaking = false
+        transcriptOfQuestionBeingAnswered = transcript
+        answerSpeechSegmenter = StreamingSpeechSegmenter()
+        hasAnswerSpeechBegun = false
+        answerSpeechStartWaitTask?.cancel()
+        answerSpeechStartWaitTask = nil
+        // For measuring how long until Clicky starts talking
+        let questionSentSystemUptime = ProcessInfo.processInfo.systemUptime
 
         if isLiveSessionActive {
             liveSessionQuestionCount += 1
@@ -828,17 +921,35 @@ final class CompanionManager: ObservableObject {
                         : Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
+                    onTextChunk: { [weak self] accumulatedResponseText in
+                        // Start speaking as soon as the first sentence is written,
+                        // while Claude keeps writing the rest. No text is displayed;
+                        // the spinner stays until the audio starts.
+                        guard let self, !Task.isCancelled,
+                              self.responsePipelineGeneration == thisResponsePipelineGeneration,
+                              let speechSegment = self.answerSpeechSegmenter.nextSegmentReadyToSpeak(
+                                  streamedTextSoFar: accumulatedResponseText
+                              ) else {
+                            return
+                        }
+                        self.speakAnswerSegment(
+                            speechSegment,
+                            pipelineGenerationForSegment: thisResponsePipelineGeneration,
+                            questionSentSystemUptime: questionSentSystemUptime
+                        )
                     }
                 )
 
                 guard !Task.isCancelled else { return }
+                print(String(format: "⏱️ Claude finished writing the answer %.2fs after the question was sent",
+                             ProcessInfo.processInfo.systemUptime - questionSentSystemUptime))
 
                 // Overheard speech that wasn't meant for Clicky: say nothing,
                 // point at nothing, and keep it out of the conversation history.
-                if wasHeardHandsFree
-                    && fullResponseText.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix(Self.overheardSpeechSilentReply) {
+                // Checked for push-to-talk too: Claude sometimes repeats the
+                // [SILENT] reply it saw earlier in the conversation, and it must
+                // never be read aloud.
+                if fullResponseText.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix(Self.overheardSpeechSilentReply) {
                     print("🤫 Hands-free: \"\(transcript)\" wasn't meant for Clicky, staying quiet")
                     voiceState = .idle
                     scheduleTransientHideIfNeeded()
@@ -848,6 +959,19 @@ final class CompanionManager: ObservableObject {
                 // Parse the [POINT:...] tag from Claude's response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
+
+                // Speak whatever wasn't spoken while Claude was writing (often
+                // the whole answer, when it's a single sentence)
+                if let remainingSpeechSegment = answerSpeechSegmenter.remainingSegmentToSpeak(finalSpokenText: spokenText) {
+                    speakAnswerSegment(
+                        remainingSpeechSegment,
+                        pipelineGenerationForSegment: thisResponsePipelineGeneration,
+                        questionSentSystemUptime: questionSentSystemUptime
+                    )
+                }
+                if hasAnswerSpeechBegun {
+                    elevenLabsTTSClient.finishSpeechText()
+                }
 
                 // Handle element pointing if Claude returned coordinates.
                 // Switch to idle BEFORE setting the location so the triangle
@@ -931,6 +1055,9 @@ final class CompanionManager: ObservableObject {
                     print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
                 }
 
+                appendToConversationTranscript(speaker: .user, text: transcript)
+                appendToConversationTranscript(speaker: .clicky, text: spokenText)
+
                 // Save this exchange to conversation history (with the point tag
                 // stripped so it doesn't confuse future context)
                 conversationHistory.append((
@@ -947,22 +1074,14 @@ final class CompanionManager: ObservableObject {
 
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
-                // Play the response via TTS. Keep the spinner (processing state)
-                // until the audio actually starts playing, then switch to responding.
-                if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    do {
-                        try await elevenLabsTTSClient.speakText(spokenText)
-                        // speakText returns after player.play() — audio is now playing
-                        voiceState = .responding
-                    } catch {
-                        ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
-                    }
-                }
+                // Stay in this answer (spinner showing) until its audio has
+                // actually started playing, or failed
+                await answerSpeechStartWaitTask?.value
             } catch is CancellationError {
                 // User spoke again — response was interrupted
             } catch {
+                // A cancelled request can surface as a network error instead
+                guard !Task.isCancelled else { return }
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
                 speakCreditsErrorFallback()
@@ -973,6 +1092,37 @@ final class CompanionManager: ObservableObject {
                 scheduleTransientHideIfNeeded()
             }
         }
+    }
+
+    /// Hands one piece of the answer to ElevenLabs. The first piece starts the
+    /// speech, and the spinner shows until its audio actually starts playing.
+    private func speakAnswerSegment(
+        _ speechSegment: String,
+        pipelineGenerationForSegment: Int,
+        questionSentSystemUptime: TimeInterval
+    ) {
+        if !hasAnswerSpeechBegun {
+            hasAnswerSpeechBegun = true
+            elevenLabsTTSClient.beginSpeech()
+            answerSpeechStartWaitTask = Task {
+                do {
+                    try await elevenLabsTTSClient.waitUntilSpeechStartsPlaying()
+                    guard responsePipelineGeneration == pipelineGenerationForSegment else { return }
+                    print(String(format: "⏱️ Clicky started talking %.2fs after the question was sent",
+                                 ProcessInfo.processInfo.systemUptime - questionSentSystemUptime))
+                    voiceState = .responding
+                    showSpokenCaptions()
+                } catch is CancellationError {
+                    // Stopped before it started (the user asked something new)
+                } catch {
+                    guard responsePipelineGeneration == pipelineGenerationForSegment else { return }
+                    ClickyAnalytics.trackTTSError(error: error.localizedDescription)
+                    print("⚠️ ElevenLabs TTS error: \(error)")
+                    speakCreditsErrorFallback()
+                }
+            }
+        }
+        elevenLabsTTSClient.appendSpeechText(speechSegment)
     }
 
     /// If the cursor is in transient mode (user toggled "Show Clicky" off),
@@ -987,7 +1137,7 @@ final class CompanionManager: ObservableObject {
         transientHideTask?.cancel()
         transientHideTask = Task {
             // Wait for TTS audio to finish playing
-            while elevenLabsTTSClient.isPlaying {
+            while elevenLabsTTSClient.isSpeaking {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -1296,8 +1446,6 @@ final class CompanionManager: ObservableObject {
 
         switch trackingUpdate {
         case .targetFound(let targetLocationInScreenshotPixels, let frame):
-            liveTrackedElementLostTask?.cancel()
-            liveTrackedElementLostTask = nil
             let measuredScreenLocation = Self.convertScreenshotPixelLocationToGlobalScreenLocation(
                 screenshotPixelLocation: targetLocationInScreenshotPixels,
                 screenshotWidthInPixels: frame.cgImage.width,
@@ -1317,10 +1465,16 @@ final class CompanionManager: ObservableObject {
 
             // The frame is slightly old by now; the estimator adds any scrolling
             // since it was captured so the buddy doesn't get pulled backwards.
-            liveTrackedElementPositionEstimator?.applyTrackingMeasurement(
+            let wasMeasurementTrusted = liveTrackedElementPositionEstimator?.applyTrackingMeasurement(
                 measuredScreenLocation: measuredScreenLocation,
                 frameCaptureTimestamp: frame.captureTimestamp
-            )
+            ) ?? true
+            guard wasMeasurementTrusted else {
+                handleTrackingMatchThatDidNotMoveWithScrolling()
+                return
+            }
+            liveTrackedElementLostTask?.cancel()
+            liveTrackedElementLostTask = nil
             let estimatedScreenLocation = liveTrackedElementPositionEstimator?.estimatedScreenLocation ?? measuredScreenLocation
             if isSearchingForLostTrackedElement {
                 handleLostTrackedElementFoundAgain(atScreenLocation: estimatedScreenLocation, displayFrame: frame.displayFrame)
@@ -1351,6 +1505,37 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// The tracker found a match that stayed put while the user scrolled, so
+    /// it's latched onto something that doesn't scroll (like the copy of a
+    /// repo's buttons GitHub pins at the top). Follow the scrolling instead,
+    /// and if that has carried the element out of view, it's lost: say so.
+    private func handleTrackingMatchThatDidNotMoveWithScrolling() {
+        guard !isSearchingForLostTrackedElement,
+              let liveTrackedElementPositionEstimator,
+              let liveTrackedElementDisplayFrame else {
+            return
+        }
+        #if DEBUG
+        print("🐞 Tracking: ignored a match that didn't move with scrolling (sticky header or look-alike)")
+        #endif
+
+        let estimatedScreenLocation = liveTrackedElementPositionEstimator.estimatedScreenLocation
+        let hasScrolledOutOfView = TrackedElementLastSeenPosition.hasScrolledOutOfView(
+            estimatedScreenLocation: estimatedScreenLocation,
+            displayFrame: liveTrackedElementDisplayFrame,
+            recentScrollDrivenScreenMovement: liveTrackedElementPositionEstimator.recentScrollDrivenScreenMovement(
+                asOf: ProcessInfo.processInfo.systemUptime
+            )
+        )
+        if hasScrolledOutOfView {
+            liveTrackedElementLostTask?.cancel()
+            liveTrackedElementLostTask = nil
+            handleLiveTrackedElementLost()
+        } else {
+            liveTrackedElementScreenLocation = estimatedScreenLocation
+        }
+    }
+
     /// The tracked element has been missing long enough to give up. The buddy
     /// flies back to the cursor, and Clicky tells the user where it went.
     private func handleLiveTrackedElementLost() {
@@ -1361,6 +1546,16 @@ final class CompanionManager: ObservableObject {
             lastSeenPositionFromScrollEstimate = TrackedElementLastSeenPosition.fromEstimatedScreenLocation(
                 liveTrackedElementPositionEstimator.estimatedScreenLocation,
                 displayFrame: liveTrackedElementDisplayFrame
+            )
+            // Content usually vanishes under a toolbar or sticky header before
+            // reaching the screen edge, so also go by which way the user was
+            // scrolling it
+            ?? TrackedElementLastSeenPosition.fromRecentScrolling(
+                estimatedScreenLocation: liveTrackedElementPositionEstimator.estimatedScreenLocation,
+                displayFrame: liveTrackedElementDisplayFrame,
+                recentScrollDrivenScreenMovement: liveTrackedElementPositionEstimator.recentScrollDrivenScreenMovement(
+                    asOf: ProcessInfo.processInfo.systemUptime
+                )
             )
         }
         let lastSeenPosition = lastSeenPositionFromScrollEstimate
@@ -1417,7 +1612,7 @@ final class CompanionManager: ObservableObject {
         lostTrackedElementAnnouncementTask = Task {
             // The user often scrolls while Clicky is still answering. Let the
             // answer finish instead of talking over it.
-            while elevenLabsTTSClient.isPlaying {
+            while elevenLabsTTSClient.isSpeaking {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -1428,6 +1623,8 @@ final class CompanionManager: ObservableObject {
             isLostTrackedElementAnnouncementSpeaking = true
             do {
                 try await elevenLabsTTSClient.speakText(announcementText)
+                showSpokenCaptions()
+                appendToConversationTranscript(speaker: .clicky, text: announcementText)
             } catch {
                 isLostTrackedElementAnnouncementSpeaking = false
                 print("⚠️ Live session: couldn't speak lost-element announcement: \(error)")
@@ -1464,7 +1661,7 @@ final class CompanionManager: ObservableObject {
     private func superviseHandsFreeListening() {
         if isLostTrackedElementAnnouncementSpeaking
             && lostTrackedElementAnnouncementTask == nil
-            && !elevenLabsTTSClient.isPlaying {
+            && !elevenLabsTTSClient.isSpeaking {
             isLostTrackedElementAnnouncementSpeaking = false
         }
 
@@ -1475,7 +1672,7 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        let isClickyThinkingOrTalking = isResponsePipelineRunning || elevenLabsTTSClient.isPlaying
+        let isClickyThinkingOrTalking = isResponsePipelineRunning || elevenLabsTTSClient.isSpeaking
         let isPushToTalkInUse = globalPushToTalkShortcutMonitor.isShortcutCurrentlyPressed
             || (buddyDictationManager.isDictationInProgress && !isHandsFreeDictationActive)
         let now = Date()
@@ -1491,38 +1688,70 @@ final class CompanionManager: ObservableObject {
                 return
             }
 
-            if isClickyThinkingOrTalking {
-                cancelHandsFreeDictation()
-                return
-            }
-
             // Still starting up, or already finalizing the transcript
             guard buddyDictationManager.isRecordingFromKeyboardShortcut else { return }
 
             let currentTranscript = buddyDictationManager.latestRecognizedText
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if elevenLabsTTSClient.isSpeaking {
+                handsFreeDictationOverlappedClickySpeech = true
+            } else if handsFreeDictationOverlappedClickySpeech && !hasHandsFreeListeningHeardSpeech {
+                // Clicky finished talking and the user didn't talk over it
+                let usersOwnWords = ClickySpeechInterruptionDetector.userWordsWhileClickyTalks(
+                    heardText: currentTranscript,
+                    clickySpeechText: elevenLabsTTSClient.textSpokenSoFar
+                )
+                if usersOwnWords.isEmpty {
+                    // Only Clicky's voice so far: listen afresh, so it isn't at
+                    // the front of the next question
+                    cancelHandsFreeDictation()
+                    return
+                }
+                // The user started right as Clicky finished: keep listening,
+                // and remove Clicky's voice from the transcript at the end
+                handsFreeClickySpeechTextToRemoveFromTranscript = elevenLabsTTSClient.textSpokenSoFar
+                startTreatingHandsFreeListeningAsUserSpeech(now: now)
+            }
+
             if currentTranscript != handsFreeLastSeenTranscript {
                 handsFreeLastSeenTranscript = currentTranscript
                 handsFreeLastTranscriptChangeDate = now
 
-                if !currentTranscript.isEmpty && !hasHandsFreeListeningHeardSpeech {
+                // Only the user's own words count, not Clicky's voice coming
+                // back through the microphone
+                let clickySpeechTextHeardByMicrophone = handsFreeClickySpeechTextToRemoveFromTranscript
+                    ?? (handsFreeDictationOverlappedClickySpeech ? elevenLabsTTSClient.textSpokenSoFar : "")
+                let usersOwnWords = ClickySpeechInterruptionDetector.userWordsWhileClickyTalks(
+                    heardText: currentTranscript,
+                    clickySpeechText: clickySpeechTextHeardByMicrophone
+                )
+                let usersOwnText = usersOwnWords.joined(separator: " ")
+                handsFreeUsersOwnWordsHeardOverClicky = usersOwnWords
+
+                if !usersOwnWords.isEmpty && !hasHandsFreeListeningHeardSpeech {
                     handsFreeSpeechStartedSystemUptime = ProcessInfo.processInfo.systemUptime
                 }
 
                 // The microphone may be hearing the Mac's own speakers (a video,
                 // a podcast). Drop it quietly as soon as it's clear, before the
                 // waveform shows or anything is sent.
-                if isHeardSpeechAnEchoOfComputerAudio(currentTranscript) {
-                    print("🎙️ Hands-free: ignored sound from this Mac: \"\(currentTranscript)\"")
+                if isHeardSpeechAnEchoOfComputerAudio(usersOwnText) {
+                    print("🎙️ Hands-free: ignored sound from this Mac: \"\(usersOwnText)\"")
                     cancelHandsFreeDictation()
                     return
                 }
 
-                if !currentTranscript.isEmpty && !hasHandsFreeListeningHeardSpeech {
-                    hasHandsFreeListeningHeardSpeech = true
-                    liveSessionLastActivityDate = now
-                    voiceState = .listening
+                // While Clicky thinks or talks, talking over it is handled below
+                if !usersOwnWords.isEmpty && !hasHandsFreeListeningHeardSpeech && !isClickyThinkingOrTalking {
+                    startTreatingHandsFreeListeningAsUserSpeech(now: now)
                 }
+            }
+
+            // Talking over Clicky, checked on every tick (not just when the
+            // transcript changes) so a word that has lasted can be acted on
+            if !hasHandsFreeListeningHeardSpeech && isClickyThinkingOrTalking {
+                reactToUserTalkingOverClickyIfSure(now: now)
             }
 
             if hasHandsFreeListeningHeardSpeech
@@ -1539,8 +1768,9 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        guard !isClickyThinkingOrTalking,
-              !isPushToTalkInUse,
+        // Listening continues while Clicky thinks and talks, so the user can
+        // talk over it
+        guard !isPushToTalkInUse,
               !buddyDictationManager.isDictationInProgress,
               !showOnboardingVideo,
               now >= handsFreeNextStartAllowedDate else {
@@ -1554,6 +1784,11 @@ final class CompanionManager: ObservableObject {
         isHandsFreeDictationStarting = true
         hasHandsFreeListeningHeardSpeech = false
         handsFreeLastSeenTranscript = ""
+        handsFreeDictationOverlappedClickySpeech = elevenLabsTTSClient.isSpeaking
+        handsFreeClickySpeechTextToRemoveFromTranscript = nil
+        handsFreeQuestionInterruptedWhileThinking = nil
+        handsFreeUsersOwnWordsHeardOverClicky = []
+        handsFreePendingInterruption = nil
         handsFreeDictationStartedDate = Date()
 
         Task {
@@ -1584,6 +1819,84 @@ final class CompanionManager: ObservableObject {
         )
     }
 
+    /// Stops Clicky when the user talks over it: a stop word while it speaks,
+    /// or two or more words while it's still thinking. Only reacts to words
+    /// that have lasted `handsFreeInterruptionMustLastSeconds`, since
+    /// recognition often turns a misheard bit of Clicky's voice into the
+    /// right word a moment later.
+    private func reactToUserTalkingOverClickyIfSure(now: Date) {
+        let usersOwnWords = handsFreeUsersOwnWordsHeardOverClicky
+        // While Clicky's voice is playing, only a clear stop word stops it.
+        // Through laptop speakers the microphone's transcript of Clicky's own
+        // voice is too unreliable ("get" for "github", "seven" for "7.7k") to
+        // react to any word: it kept fading and stopping itself. While Clicky
+        // is still thinking there's no echo, so anything the user says counts.
+        let interruptionResponse: ClickySpeechInterruptionDetector.InterruptionResponse
+        if elevenLabsTTSClient.isSpeaking {
+            interruptionResponse = ClickySpeechInterruptionDetector.containsStopWord(usersOwnWords) ? .stopClicky : .none
+        } else {
+            interruptionResponse = ClickySpeechInterruptionDetector.interruptionResponse(toUserWords: usersOwnWords)
+        }
+        guard interruptionResponse != .none else {
+            handsFreePendingInterruption = nil
+            return
+        }
+
+        if handsFreePendingInterruption?.response != interruptionResponse {
+            handsFreePendingInterruption = (response: interruptionResponse, firstHeardDate: now)
+        }
+        let firstHeardDate = handsFreePendingInterruption?.firstHeardDate ?? now
+        let hasLastedLongEnough = now.timeIntervalSince(firstHeardDate) >= Self.handsFreeInterruptionMustLastSeconds
+        guard hasLastedLongEnough else { return }
+
+        switch interruptionResponse {
+        case .none:
+            break
+        case .oneWordSoFar:
+            // One word while Clicky is still thinking: wait for more
+            break
+        case .stopClicky:
+            handsFreePendingInterruption = nil
+            print("✋ Hands-free: heard \"\(usersOwnWords.joined(separator: " "))\"")
+            interruptClickyForHandsFreeSpeech()
+            startTreatingHandsFreeListeningAsUserSpeech(now: now)
+        }
+    }
+
+    /// The user is talking: show the listening waveform, and send what they
+    /// say once they stop.
+    private func startTreatingHandsFreeListeningAsUserSpeech(now: Date) {
+        hasHandsFreeListeningHeardSpeech = true
+        handsFreeLastTranscriptChangeDate = now
+        liveSessionLastActivityDate = now
+        voiceState = .listening
+    }
+
+    /// The user talked over Clicky in hands-free mode: stop thinking and
+    /// talking right away and listen, like a person would.
+    private func interruptClickyForHandsFreeSpeech() {
+        let hadClickySaidAnything = !elevenLabsTTSClient.textSpokenSoFar.isEmpty
+        if hadClickySaidAnything {
+            handsFreeClickySpeechTextToRemoveFromTranscript = elevenLabsTTSClient.textSpokenSoFar
+        } else if isResponsePipelineRunning {
+            // Still thinking: the user is probably adding to their question
+            handsFreeQuestionInterruptedWhileThinking = transcriptOfQuestionBeingAnswered
+        }
+
+        currentResponseTask?.cancel()
+        responsePipelineGeneration += 1
+        isResponsePipelineRunning = false
+        answerSpeechStartWaitTask?.cancel()
+        answerSpeechStartWaitTask = nil
+        lostTrackedElementAnnouncementTask?.cancel()
+        lostTrackedElementAnnouncementTask = nil
+        isLostTrackedElementAnnouncementSpeaking = false
+        elevenLabsTTSClient.stopPlayback()
+        spokenCaptionTask?.cancel()
+        spokenCaptionText = nil
+        print("✋ Hands-free: the user talked over Clicky, stopped \(hadClickySaidAnything ? "talking" : "thinking")")
+    }
+
     private func cancelHandsFreeDictation() {
         buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
         isHandsFreeDictationActive = false
@@ -1593,18 +1906,47 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    private func handleHandsFreeUtterance(_ finalTranscript: String) {
-        let wordCount = finalTranscript.split(whereSeparator: { $0.isWhitespace }).count
+    private func handleHandsFreeUtterance(_ heardTranscript: String) {
+        let clickySpeechTextToRemove = handsFreeClickySpeechTextToRemoveFromTranscript
+        let questionInterruptedWhileThinking = handsFreeQuestionInterruptedWhileThinking
+        handsFreeClickySpeechTextToRemoveFromTranscript = nil
+        handsFreeQuestionInterruptedWhileThinking = nil
+
+        // If the user talked over Clicky, the start of the transcript is
+        // Clicky's own voice through the microphone. Keep only the user's words.
+        var usersOwnTranscript = heardTranscript
+        if let clickySpeechTextToRemove {
+            usersOwnTranscript = ClickySpeechInterruptionDetector.userWords(
+                heardText: heardTranscript,
+                clickySpeechText: clickySpeechTextToRemove
+            ).joined(separator: " ")
+        }
+
+        // "Wait", "stop", "never mind": Clicky has already stopped, nothing to send
+        let wasInterruption = clickySpeechTextToRemove != nil || questionInterruptedWhileThinking != nil
+        if wasInterruption && ClickySpeechInterruptionDetector.isOnlyAskingClickyToStop(
+            userWords: ComputerAudioEchoDetector.normalizedWords(in: usersOwnTranscript)
+        ) {
+            print("✋ Hands-free: \"\(usersOwnTranscript)\" only asked Clicky to stop (not sent)")
+            voiceState = .idle
+            return
+        }
+
+        let wordCount = usersOwnTranscript.split(whereSeparator: { $0.isWhitespace }).count
         guard wordCount >= Self.handsFreeMinimumWordCountToSend else {
-            print("🎙️ Hands-free: ignored \"\(finalTranscript)\" (too short to be a question, not sent)")
+            print("🎙️ Hands-free: ignored \"\(usersOwnTranscript)\" (too short to be a question, not sent)")
             return
         }
         // Final check: the Mac's audio transcript may have caught up since the
         // last partial transcript was compared.
-        guard !isHeardSpeechAnEchoOfComputerAudio(finalTranscript) else {
-            print("🎙️ Hands-free: ignored sound from this Mac: \"\(finalTranscript)\" (not sent)")
+        guard !isHeardSpeechAnEchoOfComputerAudio(usersOwnTranscript) else {
+            print("🎙️ Hands-free: ignored sound from this Mac: \"\(usersOwnTranscript)\" (not sent)")
             return
         }
+
+        // Talking more while Clicky was still thinking adds to the question
+        let finalTranscript = questionInterruptedWhileThinking.map { $0 + " " + usersOwnTranscript }
+            ?? usersOwnTranscript
 
         #if DEBUG
         if let computerAudioSpeechTranscriber {
@@ -1619,6 +1961,8 @@ final class CompanionManager: ObservableObject {
 
         lastTranscript = finalTranscript
         print("🗣️ Companion received transcript (hands-free): \(finalTranscript)")
+        if replayLastAnswerIfAsked(finalTranscript) { return }
+        if handleCaptionsVoiceCommandIfAsked(finalTranscript) { return }
         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
 
         // Same as pressing push-to-talk: stop pointing at the previous answer's element
@@ -1633,7 +1977,7 @@ final class CompanionManager: ObservableObject {
         guard liveTrackedElementScreenLocation != nil else { return }
 
         let now = Date()
-        if isResponsePipelineRunning || elevenLabsTTSClient.isPlaying {
+        if isResponsePipelineRunning || elevenLabsTTSClient.isSpeaking {
             liveTrackedElementLastActivityDate = now
             return
         }
@@ -1656,7 +2000,7 @@ final class CompanionManager: ObservableObject {
     private func endLiveSessionIfIdleTooLong() {
         guard isLiveSessionActive,
               !isResponsePipelineRunning,
-              !elevenLabsTTSClient.isPlaying,
+              !elevenLabsTTSClient.isSpeaking,
               !hasHandsFreeListeningHeardSpeech,
               Date().timeIntervalSince(liveSessionLastActivityDate) >= Self.liveSessionAutoEndAfterIdleSeconds else {
             return
@@ -1780,6 +2124,138 @@ final class CompanionManager: ObservableObject {
             x: displayLocalX + displayFrame.origin.x,
             y: appKitY + displayFrame.origin.y
         )
+    }
+
+    // MARK: - Captions and Replay
+
+    /// Shows `spokenText` as captions under Clicky's cursor, one line at a time, in
+    /// step with the audio that just started playing.
+    /// Opens the conversation transcript, or closes it if it's already open.
+    func toggleConversationTranscript() {
+        guard let conversationTranscriptPanelManager else { return }
+        if conversationTranscriptPanelManager.isShowingTranscript {
+            conversationTranscriptPanelManager.hideTranscript()
+        } else {
+            conversationTranscriptPanelManager.showTranscript()
+        }
+    }
+
+    /// Turns captions on or off from the shortcut or a voice command, with a
+    /// short "captions on" / "captions off" confirmation next to the cursor.
+    private func setCaptionsEnabledAndConfirm(_ shouldShowCaptions: Bool) {
+        setCaptionsEnabled(shouldShowCaptions)
+        showLiveSessionStatusBubble(shouldShowCaptions ? "captions on" : "captions off")
+        print("💬 Captions \(shouldShowCaptions ? "on" : "off")")
+    }
+
+    /// "Captions on" / "captions off": handled on the Mac, no Claude call.
+    /// Returns true if the transcript was a captions command.
+    private func handleCaptionsVoiceCommandIfAsked(_ transcript: String) -> Bool {
+        guard let requestedCaptionsSetting = CaptionsVoiceCommand.requestedCaptionsSetting(transcript) else {
+            return false
+        }
+        setCaptionsEnabledAndConfirm(requestedCaptionsSetting)
+        return true
+    }
+
+    func setCaptionsEnabled(_ shouldShowCaptions: Bool) {
+        areCaptionsEnabled = shouldShowCaptions
+        UserDefaults.standard.set(shouldShowCaptions, forKey: "areCaptionsEnabled")
+        if !shouldShowCaptions {
+            spokenCaptionTask?.cancel()
+            spokenCaptionText = nil
+        } else if elevenLabsTTSClient.isSpeaking {
+            // Turned back on while Clicky is still talking: pick the captions
+            // up again. They follow the audio's position, so they resume at
+            // the line being said right now rather than from the start.
+            showSpokenCaptions()
+        }
+    }
+
+    /// Shows captions for whatever Clicky is saying, until it stops. An answer
+    /// is spoken in pieces (see StreamingSpeechSegmenter), so captions are
+    /// laid out per piece as each one starts playing, and timed within it.
+    private func showSpokenCaptions() {
+        spokenCaptionTask?.cancel()
+        guard areCaptionsEnabled else {
+            spokenCaptionText = nil
+            return
+        }
+
+        spokenCaptionTask = Task {
+            var captionedPlaybackIdentifier: Int? = nil
+            var captionSegments: [String] = []
+            // Exact timing from ElevenLabs when available, else estimated from
+            // how much of the piece has been spoken
+            var captionSegmentStartTimes: [Double]? = nil
+
+            while !Task.isCancelled, elevenLabsTTSClient.isSpeaking {
+                if let playingSpeechSegment = elevenLabsTTSClient.currentlyPlayingSpeechSegment {
+                    if playingSpeechSegment.playbackIdentifier != captionedPlaybackIdentifier {
+                        captionedPlaybackIdentifier = playingSpeechSegment.playbackIdentifier
+                        captionSegments = SpokenCaptionTimeline.captionSegments(in: playingSpeechSegment.text)
+                        captionSegmentStartTimes = playingSpeechSegment.characterStartTimes.flatMap { characterStartTimes in
+                            SpokenCaptionTimeline.captionSegmentStartTimes(
+                                captionSegments: captionSegments,
+                                spokenText: playingSpeechSegment.text,
+                                characterStartTimes: characterStartTimes
+                            )
+                        }
+                    }
+
+                    // Between pieces nothing is playing, so the last line stays up
+                    var captionSegmentIndex: Int? = nil
+                    if let captionSegmentStartTimes,
+                       let playbackTimeInSeconds = elevenLabsTTSClient.currentSegmentPlaybackTimeInSeconds {
+                        captionSegmentIndex = SpokenCaptionTimeline.captionSegmentIndex(
+                            forPlaybackTime: playbackTimeInSeconds + Self.spokenCaptionLeadSeconds,
+                            segmentStartTimes: captionSegmentStartTimes
+                        )
+                    } else if let playbackProgressFraction = elevenLabsTTSClient.currentSegmentPlaybackProgressFraction {
+                        captionSegmentIndex = SpokenCaptionTimeline.captionSegmentIndex(
+                            forPlaybackProgress: playbackProgressFraction,
+                            captionSegments: captionSegments
+                        )
+                    }
+                    if let captionSegmentIndex,
+                       captionSegments.indices.contains(captionSegmentIndex),
+                       spokenCaptionText != captionSegments[captionSegmentIndex] {
+                        spokenCaptionText = captionSegments[captionSegmentIndex]
+                    }
+                }
+                // Check often so a new line appears right as it's spoken
+                try? await Task.sleep(nanoseconds: 30_000_000)
+            }
+            guard !Task.isCancelled else { return }
+
+            // Leave the last line up briefly so it can be read or clicked
+            try? await Task.sleep(nanoseconds: UInt64(Self.spokenCaptionLingerSeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            spokenCaptionText = nil
+        }
+    }
+
+    private func appendToConversationTranscript(speaker: ConversationTranscriptEntry.Speaker, text: String) {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else { return }
+        conversationTranscriptEntries.append(ConversationTranscriptEntry(speaker: speaker, text: trimmedText))
+        if conversationTranscriptEntries.count > Self.maximumConversationTranscriptEntryCount {
+            conversationTranscriptEntries.removeFirst(conversationTranscriptEntries.count - Self.maximumConversationTranscriptEntryCount)
+        }
+    }
+
+    /// "Say that again": replays Clicky's last answer from the saved audio,
+    /// with captions, instead of asking Claude again. Returns true if handled.
+    private func replayLastAnswerIfAsked(_ transcript: String) -> Bool {
+        guard RepeatLastAnswerRequest.isAskingToRepeatLastAnswer(transcript),
+              elevenLabsTTSClient.replayLastSpeech() else {
+            return false
+        }
+
+        print("🔁 Say that again: replaying the last answer (no Claude call)")
+        voiceState = .idle
+        showSpokenCaptions()
+        return true
     }
 
     // MARK: - Point Tag Parsing

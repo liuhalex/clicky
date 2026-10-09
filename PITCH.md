@@ -14,6 +14,7 @@ Clicky takes one screenshot when you let go of push-to-talk. If you scroll, swit
 
 **Smaller pieces:**
 - If you scroll the element away, Clicky tells you where it went. Scroll it back and the cursor returns.
+- Captions show the one line Clicky is saying right now, in its own blue bubble that follows its cursor, instead of a transcript in the notch that keeps growing. The full transcript is one click away in the menu bar. "Say that again" replays the last answer for free (no Claude call).
 - An orange ring around the cursor means hands-free is on (the same orange as the macOS mic dot).
 - Turning hands-free off shows a receipt ("3 questions sent"), and it turns itself off after 10 quiet minutes.
 

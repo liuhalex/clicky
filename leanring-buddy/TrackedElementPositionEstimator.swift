@@ -10,10 +10,15 @@
 //  instantly and say exactly how far the content moved, so the estimate moves
 //  with every scroll event, and each analyzed frame only corrects the drift.
 //
-//  Some apps scroll content faster or slower than the event deltas, and if the
-//  scroll direction convention were ever flipped the buddy would move the wrong
-//  way. Each frame measurement therefore also calibrates how much on-screen
-//  movement one point of scroll delta produces.
+//  Some apps scroll content faster or slower than the event deltas, so each
+//  frame measurement also calibrates how much on-screen movement one point of
+//  scroll delta produces.
+//
+//  When scrolling and a frame match disagree, scrolling wins. A match that
+//  stays put while the user scrolls has latched onto something that doesn't
+//  scroll: GitHub, for example, keeps a copy of a repo's Watch / Fork / Star
+//  buttons pinned at the top. Trusting it froze the buddy and taught the
+//  estimator that the page doesn't scroll.
 //
 //  All locations are global AppKit screen coordinates (bottom-left origin).
 //
@@ -30,9 +35,13 @@ nonisolated struct TrackedElementPositionEstimator {
     static let minimumScrollBetweenFramesForCalibrationInPoints: CGFloat = 30
     /// How strongly each calibration sample updates the scale (0...1).
     static let calibrationSampleWeight: CGFloat = 0.35
-    /// The learned scale stays within this range. Negative means the content
-    /// moves opposite to the scroll deltas.
-    static let allowedScrollToScreenMovementScaleRange: ClosedRange<CGFloat> = -2...2
+    /// The learned scale stays within this range. Content always moves with the
+    /// scroll (measured 0.91 in Safari, 1.0 on GitHub in Chrome), so a much
+    /// smaller scale can only come from a bad match and isn't learned.
+    static let allowedScrollToScreenMovementScaleRange: ClosedRange<CGFloat> = 0.5...2
+    /// While scrolling, a match must move at least this share of the movement
+    /// the scroll predicts, in the same direction, to be trusted.
+    static let minimumShareOfScrollMovementForTrustedMeasurement: CGFloat = 0.3
     /// Fraction of a frame measurement's correction applied right away. Frame
     /// timestamps and 4px matching resolution make each measurement a few points
     /// off; applying them fully made the buddy shake while scrolling, so small
@@ -83,9 +92,12 @@ nonisolated struct TrackedElementPositionEstimator {
     /// `frameCaptureTimestamp`. Calibrates the scroll scale, then re-anchors the
     /// estimate on the measurement plus any scrolling that happened after the
     /// frame was captured (which the frame can't show yet).
-    mutating func applyTrackingMeasurement(measuredScreenLocation: CGPoint, frameCaptureTimestamp: TimeInterval) {
+    /// Returns false if the measurement was ignored: a stale frame, or a match
+    /// that didn't move with the scrolling (so it isn't the element).
+    @discardableResult
+    mutating func applyTrackingMeasurement(measuredScreenLocation: CGPoint, frameCaptureTimestamp: TimeInterval) -> Bool {
         // Frames can arrive out of order across displays; ignore stale ones.
-        guard frameCaptureTimestamp >= lastMeasurementFrameCaptureTimestamp else { return }
+        guard frameCaptureTimestamp >= lastMeasurementFrameCaptureTimestamp else { return false }
 
         let verticalScrollBetweenFrames = totalScrollingDelta(
             after: lastMeasurementFrameCaptureTimestamp,
@@ -93,6 +105,15 @@ nonisolated struct TrackedElementPositionEstimator {
         ).deltaY
         if abs(verticalScrollBetweenFrames) >= Self.minimumScrollBetweenFramesForCalibrationInPoints {
             let measuredVerticalMovement = measuredScreenLocation.y - lastMeasuredScreenLocation.y
+            // Content moving down (positive delta) lowers AppKit y
+            let expectedVerticalMovement = -scrollToScreenMovementScale * verticalScrollBetweenFrames
+            let didMoveWithScrolling = measuredVerticalMovement * expectedVerticalMovement > 0
+                && abs(measuredVerticalMovement) >= Self.minimumShareOfScrollMovementForTrustedMeasurement * abs(expectedVerticalMovement)
+            guard didMoveWithScrolling else {
+                // Keep the last good measurement, so the next match is checked
+                // against everything scrolled since then
+                return false
+            }
             // Content moving down (positive delta) lowers AppKit y, hence the minus.
             let observedScale = -measuredVerticalMovement / verticalScrollBetweenFrames
             let clampedObservedScale = min(
@@ -121,6 +142,21 @@ nonisolated struct TrackedElementPositionEstimator {
 
         lastMeasuredScreenLocation = measuredScreenLocation
         lastMeasurementFrameCaptureTimestamp = frameCaptureTimestamp
+        return true
+    }
+
+    /// How far scrolling moved the element on screen during the last second
+    /// before `currentTimestamp` (AppKit points, y up: positive y means it
+    /// was carried up). Zero if the user wasn't scrolling.
+    func recentScrollDrivenScreenMovement(asOf currentTimestamp: TimeInterval) -> CGVector {
+        let recentScrollingDelta = totalScrollingDelta(
+            after: currentTimestamp - Self.scrollHistoryDurationSeconds,
+            upTo: .infinity
+        )
+        return CGVector(
+            dx: scrollToScreenMovementScale * recentScrollingDelta.deltaX,
+            dy: -scrollToScreenMovementScale * recentScrollingDelta.deltaY
+        )
     }
 
     private func totalScrollingDelta(after startTimestamp: TimeInterval, upTo endTimestamp: TimeInterval) -> (deltaX: CGFloat, deltaY: CGFloat) {

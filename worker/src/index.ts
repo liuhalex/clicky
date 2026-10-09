@@ -7,6 +7,8 @@
  * Routes:
  *   POST /chat  → Anthropic Messages API (streaming)
  *   POST /tts   → ElevenLabs TTS API
+ *   POST /tts-with-timestamps → ElevenLabs TTS with per-character timings
+ *                               (used to time captions exactly to the voice)
  */
 
 interface Env {
@@ -31,6 +33,10 @@ export default {
 
       if (url.pathname === "/tts") {
         return await handleTTS(request, env);
+      }
+
+      if (url.pathname === "/tts-with-timestamps") {
+        return await handleTTSWithTimestamps(request, env);
       }
 
       if (url.pathname === "/transcribe-token") {
@@ -137,5 +143,41 @@ async function handleTTS(request: Request, env: Env): Promise<Response> {
     headers: {
       "content-type": response.headers.get("content-type") || "audio/mpeg",
     },
+  });
+}
+
+/**
+ * Same as /tts, but ElevenLabs returns JSON with the audio (base64) plus the
+ * time each character starts being spoken. Clicky uses the timings to switch
+ * captions exactly when it starts saying the next line. Same cost as /tts.
+ */
+async function handleTTSWithTimestamps(request: Request, env: Env): Promise<Response> {
+  const body = await request.text();
+  const voiceId = env.ELEVENLABS_VOICE_ID;
+
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/with-timestamps`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": env.ELEVENLABS_API_KEY,
+        "content-type": "application/json",
+      },
+      body,
+    }
+  );
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/tts-with-timestamps] ElevenLabs API error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, {
+      status: response.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  return new Response(response.body, {
+    status: response.status,
+    headers: { "content-type": "application/json" },
   });
 }

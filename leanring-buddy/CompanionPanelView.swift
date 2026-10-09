@@ -62,6 +62,17 @@ struct CompanionPanelView: View {
                 Spacer()
                     .frame(height: 16)
 
+                captionsToggleRow
+                    .padding(.horizontal, 16)
+
+                transcriptButtonRow
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 16)
+
                 dmFarzaButton
                     .padding(.horizontal, 16)
             }
@@ -570,6 +581,76 @@ struct CompanionPanelView: View {
             .labelsHidden()
             .tint(DS.Colors.accent)
             .scaleEffect(0.8)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Transcript Button
+
+    /// Opens the scrollable transcript of the conversation so far.
+    private var transcriptButtonRow: some View {
+        Button {
+            companionManager.toggleConversationTranscript()
+        } label: {
+            HStack {
+                HStack(spacing: 8) {
+                    Image(systemName: "text.bubble")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(width: 16)
+
+                    Text("Transcript")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering in
+            if isHovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+    }
+
+    // MARK: - Captions Toggle
+
+    /// Turns captions (what Clicky is saying, one line at a time, in its blue bubble) on or off.
+    private var captionsToggleRow: some View {
+        HStack {
+            HStack(spacing: 8) {
+                Image(systemName: "captions.bubble")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .frame(width: 16)
+
+                Text("Captions")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+
+                // Shortcut hint, so people discover ctrl + shift + c
+                Text("⌃⇧C")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { companionManager.areCaptionsEnabled },
+                set: { companionManager.setCaptionsEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.accent)
+            .scaleEffect(0.8)
+            .onHover { isHovering in
+                if isHovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+            }
         }
         .padding(.vertical, 4)
     }

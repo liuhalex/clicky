@@ -190,6 +190,33 @@ struct BlueCursorView: View {
     /// Measured size of the live session status bubble, used to anchor its left edge beside the buddy.
     @State private var liveSessionStatusBubbleSize: CGSize = .zero
 
+    /// The caption text currently drawn in the bubble. The first line of an
+    /// answer is typed out letter by letter; later lines replace it whole.
+    @State private var displayedSpokenCaptionText: String = ""
+    /// Starts small and springs to full size as the first letter appears,
+    /// the same entrance as the pointing bubble.
+    @State private var spokenCaptionBubbleScale: CGFloat = 1.0
+    /// Bumped whenever the caption changes, so a typing animation that's still
+    /// running for an older line stops instead of mixing letters in.
+    @State private var spokenCaptionTypingGeneration: Int = 0
+    /// Changes once per caption line (not per typed letter), so only switching
+    /// to a new line plays the crossfade.
+    @State private var spokenCaptionLineIdentity: Int = 0
+    /// Soft crossfade between lines. No sliding or bouncing: earlier versions
+    /// that moved the text felt jerky.
+    private let spokenCaptionLineSwitchAnimation = Animation.easeInOut(duration: 0.18)
+    /// Width and number of lines (1 or 2) of the text area inside the caption
+    /// bubble. Both only grow during an answer (never shrink), so the bubble
+    /// resizes as rarely as possible.
+    @State private var spokenCaptionTextAreaWidth: CGFloat = 0
+    @State private var spokenCaptionTextAreaLineCount: Int = 1
+    private let spokenCaptionHorizontalPadding: CGFloat = 8
+    private let spokenCaptionVerticalPadding: CGFloat = 4
+    private let spokenCaptionLineHeight: CGFloat = 14
+    private var spokenCaptionTextAreaHeight: CGFloat {
+        CGFloat(spokenCaptionTextAreaLineCount) * spokenCaptionLineHeight
+    }
+
     /// Scale factor for the navigation speech bubble's pop-in entrance.
     /// Starts at 0.5 and springs to 1.0 when the first character appears.
     @State private var navigationBubbleScale: CGFloat = 1.0
@@ -318,10 +345,56 @@ struct BlueCursorView: View {
                     }
             }
 
+            // Caption bubble — what Clicky is saying right now, in the same blue
+            // bubble it uses when pointing, following the buddy wherever it goes.
+            // The first line types out letter by letter (the bubble grows with it).
+            // After that the bubble keeps its width and only the text changes,
+            // with a soft crossfade; it widens (never shrinks) only if a later
+            // line needs more room.
+            if buddyIsVisibleOnThisScreen && companionManager.spokenCaptionText != nil && !displayedSpokenCaptionText.isEmpty {
+                ZStack(alignment: .leading) {
+                    Text(displayedSpokenCaptionText)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                        .lineSpacing(0)
+                        .frame(width: spokenCaptionTextAreaWidth, alignment: .leading)
+                        .id(spokenCaptionLineIdentity)
+                        .transition(.opacity)
+                }
+                    .frame(width: spokenCaptionTextAreaWidth, height: spokenCaptionTextAreaHeight, alignment: .topLeading)
+                    .padding(.horizontal, spokenCaptionHorizontalPadding)
+                    .padding(.vertical, spokenCaptionVerticalPadding)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(DS.Colors.overlayCursorBlue)
+                            .shadow(
+                                color: DS.Colors.overlayCursorBlue.opacity(0.5 + (1.0 - spokenCaptionBubbleScale) * 1.0),
+                                radius: 6 + (1.0 - spokenCaptionBubbleScale) * 16,
+                                x: 0, y: 0
+                            )
+                    )
+                    .scaleEffect(spokenCaptionBubbleScale, anchor: .leading)
+                    // Position comes from the computed width (not a measurement
+                    // after drawing), so the bubble never wobbles sideways
+                    // Top edge stays put, so a second line grows downward
+                    .position(
+                        x: cursorPosition.x + 10 + (spokenCaptionTextAreaWidth + spokenCaptionHorizontalPadding * 2) / 2,
+                        y: cursorPosition.y + 8 + (spokenCaptionTextAreaHeight + spokenCaptionVerticalPadding * 2) / 2
+                    )
+                    .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
+                    .animation(.easeOut(duration: 0.25), value: spokenCaptionBubbleScale)
+                    .animation(spokenCaptionLineSwitchAnimation, value: spokenCaptionLineIdentity)
+                    .allowsHitTesting(false)
+            }
+
             // Navigation pointer bubble — shown when buddy arrives at a detected element.
             // Pops in with a scale-bounce (0.5x → 1.0x spring) and a bright initial
             // glow that settles, creating a "materializing" effect.
-            if buddyNavigationMode == .pointingAtTarget && !navigationBubbleText.isEmpty {
+            // Hidden while a caption is showing: the caption uses this same blue
+            // bubble in the same spot, so there's never two.
+            if buddyNavigationMode == .pointingAtTarget && !navigationBubbleText.isEmpty
+                && companionManager.spokenCaptionText == nil {
                 Text(navigationBubbleText)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.white)
@@ -490,6 +563,42 @@ struct BlueCursorView: View {
             }
 
             startNavigatingToElement(screenLocation: screenLocation)
+        }
+        .onChange(of: companionManager.spokenCaptionText) { previousCaptionText, newCaptionText in
+            spokenCaptionTypingGeneration += 1
+            guard let newCaptionText else {
+                displayedSpokenCaptionText = ""
+                return
+            }
+
+            if previousCaptionText == nil {
+                // First line of what Clicky is saying: type it out, the bubble
+                // growing with it
+                displayedSpokenCaptionText = ""
+                spokenCaptionTextAreaWidth = 0
+                spokenCaptionTextAreaLineCount = 1
+                spokenCaptionBubbleScale = 0.6
+                streamSpokenCaptionCharacter(
+                    captionText: newCaptionText,
+                    characterIndex: 0,
+                    typingGeneration: spokenCaptionTypingGeneration
+                )
+            } else {
+                // Next line: crossfade the text. The bubble keeps its size
+                // unless this text needs more room, then grows gently once.
+                let neededTextAreaSize = spokenCaptionTextAreaSize(for: newCaptionText)
+                withAnimation(spokenCaptionLineSwitchAnimation) {
+                    spokenCaptionLineIdentity += 1
+                    displayedSpokenCaptionText = newCaptionText
+                }
+                if neededTextAreaSize.width > spokenCaptionTextAreaWidth
+                    || neededTextAreaSize.lineCount > spokenCaptionTextAreaLineCount {
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        spokenCaptionTextAreaWidth = max(spokenCaptionTextAreaWidth, neededTextAreaSize.width)
+                        spokenCaptionTextAreaLineCount = max(spokenCaptionTextAreaLineCount, neededTextAreaSize.lineCount)
+                    }
+                }
+            }
         }
         .onChange(of: companionManager.liveTrackedElementScreenLocation) { _, newTrackedLocation in
             guard let newTrackedLocation else {
@@ -776,6 +885,41 @@ struct BlueCursorView: View {
 
     /// Streams the navigation bubble text one character at a time with variable
     /// delays (30–60ms) for a natural "speaking" rhythm.
+    /// How much room `captionText` needs: the width of its widest wrapped line
+    /// and its line count (see SpokenCaptionTimeline). Measured directly so the
+    /// bubble's size and position don't depend on a measurement after drawing.
+    private func spokenCaptionTextAreaSize(for captionText: String) -> (width: CGFloat, lineCount: Int) {
+        return SpokenCaptionTimeline.captionTextAreaSize(for: captionText)
+    }
+
+    /// Types the first caption line one letter at a time (20–40ms each), so the
+    /// bubble grows as Clicky starts talking. Stops if the caption changes.
+    private func streamSpokenCaptionCharacter(captionText: String, characterIndex: Int, typingGeneration: Int) {
+        guard typingGeneration == spokenCaptionTypingGeneration,
+              characterIndex < captionText.count else {
+            return
+        }
+
+        let characterPosition = captionText.index(captionText.startIndex, offsetBy: characterIndex)
+        displayedSpokenCaptionText.append(captionText[characterPosition])
+        let neededTextAreaSize = spokenCaptionTextAreaSize(for: displayedSpokenCaptionText)
+        spokenCaptionTextAreaWidth = max(spokenCaptionTextAreaWidth, neededTextAreaSize.width)
+        spokenCaptionTextAreaLineCount = max(spokenCaptionTextAreaLineCount, neededTextAreaSize.lineCount)
+
+        // On the first letter, spring the bubble up to full size
+        if characterIndex == 0 {
+            spokenCaptionBubbleScale = 1.0
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + Double.random(in: 0.02...0.04)) {
+            self.streamSpokenCaptionCharacter(
+                captionText: captionText,
+                characterIndex: characterIndex + 1,
+                typingGeneration: typingGeneration
+            )
+        }
+    }
+
     private func streamNavigationBubbleCharacter(
         phrase: String,
         characterIndex: Int,

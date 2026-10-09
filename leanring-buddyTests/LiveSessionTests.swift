@@ -78,6 +78,382 @@ struct LiveSessionToggleShortcutTests {
     }
 }
 
+// MARK: - Captions and Replay
+
+struct SpokenCaptionTimelineTests {
+    /// Every character is 6pt wide, so a 60pt line holds 10 characters.
+    private let measureTextWidthAtSixPointsPerCharacter: (String) -> CGFloat = { CGFloat($0.count) * 6 }
+
+    private func captionSegments(_ spokenText: String) -> [String] {
+        SpokenCaptionTimeline.captionSegments(
+            in: spokenText,
+            maximumLineWidth: 60,
+            maximumLineCount: 2,
+            measureTextWidth: measureTextWidthAtSixPointsPerCharacter
+        )
+    }
+
+    @Test func shortTextIsOneCaption() {
+        #expect(captionSegments("hi there") == ["hi there"])
+    }
+
+    @Test func longTextFillsEveryCaptionEvenly() {
+        let spokenText = "click the export button up top then pick pdf from the list and press save to finish"
+        let segments = captionSegments(spokenText)
+        #expect(segments.count > 1)
+        // Nothing lost or reordered
+        #expect(segments.joined(separator: " ") == spokenText)
+        // Every caption fits in two lines of 10 characters
+        for segment in segments {
+            let wrappedLineCount = SpokenCaptionTimeline.wrappedLineCount(
+                of: segment.split(separator: " ").map(String.init),
+                maximumLineWidth: 60,
+                measureTextWidth: measureTextWidthAtSixPointsPerCharacter
+            )
+            #expect(wrappedLineCount <= 2, "\(segment)")
+        }
+        // Evenly filled: no short leftover caption at the end
+        let segmentLengths = segments.map(\.count)
+        #expect(Double(segmentLengths.min()!) >= 0.6 * Double(segmentLengths.max()!), "\(segments)")
+    }
+
+    @Test func captionsFollowTheTextAcrossSentenceEnds() {
+        let segments = captionSegments("open settings. then click general. then scroll down to about.")
+        #expect(segments.joined(separator: " ") == "open settings. then click general. then scroll down to about.")
+    }
+
+    @Test func lineBreaksNeverEndUpInsideACaption() {
+        // A caption starting with a line break rendered as two lines with an empty one on top
+        let segments = captionSegments("first, open settings.\nthen click general.\n\n  done!")
+        #expect(segments.allSatisfy { !$0.contains("\n") })
+        #expect(segments.joined(separator: " ") == "first, open settings. then click general. done!")
+    }
+
+    @Test func exactTimingsComeFromTheFirstCharacterOfEachCaption() {
+        let spokenText = "hi there. how are you?"
+        let characterStartTimes = (0..<spokenText.count).map { Double($0) * 0.1 }
+        let segmentStartTimes = SpokenCaptionTimeline.captionSegmentStartTimes(
+            captionSegments: ["hi there.", "how are you?"],
+            spokenText: spokenText,
+            characterStartTimes: characterStartTimes
+        )
+        // "how" is character 10, so the second caption starts at 1.0s
+        #expect(segmentStartTimes?.count == 2)
+        #expect(abs((segmentStartTimes?[1] ?? 0) - 1.0) < 0.0001)
+        #expect(SpokenCaptionTimeline.captionSegmentIndex(forPlaybackTime: 0.95, segmentStartTimes: segmentStartTimes!) == 0)
+        #expect(SpokenCaptionTimeline.captionSegmentIndex(forPlaybackTime: 1.05, segmentStartTimes: segmentStartTimes!) == 1)
+    }
+
+    @Test func mismatchedTimingsFallBackToEstimates() {
+        #expect(SpokenCaptionTimeline.captionSegmentStartTimes(
+            captionSegments: ["hi."], spokenText: "hi.", characterStartTimes: [0, 0.1]
+        ) == nil)
+    }
+
+    @Test func estimatedTimingFollowsPlaybackProgress() {
+        // Two captions of equal length: first half of the audio shows the first one
+        let captionSegments = ["aaaa bbbb.", "cccc dddd."]
+        #expect(SpokenCaptionTimeline.captionSegmentIndex(forPlaybackProgress: 0.3, captionSegments: captionSegments) == 0)
+        #expect(SpokenCaptionTimeline.captionSegmentIndex(forPlaybackProgress: 0.7, captionSegments: captionSegments) == 1)
+    }
+
+    @Test func emptyTextHasNoCaptions() {
+        #expect(captionSegments("   ").isEmpty)
+    }
+}
+
+struct LostElementScrolledUnderToolbarTests {
+    // A 1512x982 display; AppKit y points up, so the top of the screen is y = 982
+    private let displayFrame = CGRect(x: 0, y: 0, width: 1512, height: 982)
+
+    @Test func scrollingUpUnderTheBrowserToolbarCountsAsScrolledOffTheTop() {
+        // Vanished ~120pt below the top edge (under the tab and address bar)
+        // while the user was scrolling the page up
+        let lastSeenPosition = TrackedElementLastSeenPosition.fromRecentScrolling(
+            estimatedScreenLocation: CGPoint(x: 906, y: 860),
+            displayFrame: displayFrame,
+            recentScrollDrivenScreenMovement: CGVector(dx: 0, dy: 240)
+        )
+        #expect(lastSeenPosition == .scrolledOffTop)
+    }
+
+    @Test func scrollingDownPastTheBottomCountsAsScrolledOffTheBottom() {
+        let lastSeenPosition = TrackedElementLastSeenPosition.fromRecentScrolling(
+            estimatedScreenLocation: CGPoint(x: 700, y: 90),
+            displayFrame: displayFrame,
+            recentScrollDrivenScreenMovement: CGVector(dx: 0, dy: -180)
+        )
+        #expect(lastSeenPosition == .scrolledOffBottom)
+    }
+
+    @Test func scrolledUpUnderTheToolbarIsOutOfView() {
+        let movingUp = CGVector(dx: 0, dy: 200)
+        // 100pt below the top edge: under the menu bar and browser toolbar
+        #expect(TrackedElementLastSeenPosition.hasScrolledOutOfView(
+            estimatedScreenLocation: CGPoint(x: 906, y: 882), displayFrame: displayFrame, recentScrollDrivenScreenMovement: movingUp))
+        // Still well inside the page
+        #expect(!TrackedElementLastSeenPosition.hasScrolledOutOfView(
+            estimatedScreenLocation: CGPoint(x: 906, y: 600), displayFrame: displayFrame, recentScrollDrivenScreenMovement: movingUp))
+        // Past the bottom edge
+        #expect(TrackedElementLastSeenPosition.hasScrolledOutOfView(
+            estimatedScreenLocation: CGPoint(x: 906, y: -20), displayFrame: displayFrame, recentScrollDrivenScreenMovement: CGVector(dx: 0, dy: -200)))
+    }
+
+    @Test func notScrollingMeansThePageChanged() {
+        // Clicked a link or switched tabs: Clicky should stay quiet
+        let lastSeenPosition = TrackedElementLastSeenPosition.fromRecentScrolling(
+            estimatedScreenLocation: CGPoint(x: 906, y: 860),
+            displayFrame: displayFrame,
+            recentScrollDrivenScreenMovement: CGVector(dx: 0, dy: 3)
+        )
+        #expect(lastSeenPosition == nil)
+    }
+
+    @Test func scrollingAwayFromAnEdgeDoesNotCountAsLeavingThroughIt() {
+        // Near the top but being scrolled down, so it didn't go off the top
+        let lastSeenPosition = TrackedElementLastSeenPosition.fromRecentScrolling(
+            estimatedScreenLocation: CGPoint(x: 906, y: 860),
+            displayFrame: displayFrame,
+            recentScrollDrivenScreenMovement: CGVector(dx: 0, dy: -200)
+        )
+        #expect(lastSeenPosition == nil)
+    }
+
+    @Test func recentScrollingIsMeasuredFromScrollEvents() {
+        var estimator = TrackedElementPositionEstimator(
+            initialScreenLocation: CGPoint(x: 906, y: 552),
+            frameCaptureTimestamp: 100
+        )
+        // Trackpad scrolling the page up: negative deltas carry content up
+        estimator.applyScrollWheelMovement(scrollingDeltaX: 0, scrollingDeltaY: -60, timestamp: 100.2)
+        estimator.applyScrollWheelMovement(scrollingDeltaX: 0, scrollingDeltaY: -60, timestamp: 100.4)
+        #expect(estimator.recentScrollDrivenScreenMovement(asOf: 100.5).dy == 120)
+        // Over a second later, that scrolling no longer counts
+        #expect(estimator.recentScrollDrivenScreenMovement(asOf: 102).dy == 0)
+    }
+}
+
+struct StreamingSpeechSegmenterTests {
+    @Test func firstSentenceIsSpokenWhileTheRestIsStillBeingWritten() {
+        var segmenter = StreamingSpeechSegmenter()
+        #expect(segmenter.nextSegmentReadyToSpeak(streamedTextSoFar: "see that export but") == nil)
+        // Not finished until the next character shows the sentence really ended
+        #expect(segmenter.nextSegmentReadyToSpeak(streamedTextSoFar: "see that export button up top?") == nil)
+        #expect(segmenter.nextSegmentReadyToSpeak(streamedTextSoFar: "see that export button up top? click") == "see that export button up top?")
+        // Already spoken, nothing new yet
+        #expect(segmenter.nextSegmentReadyToSpeak(streamedTextSoFar: "see that export button up top? click it") == nil)
+    }
+
+    @Test func tooShortFirstSentenceWaitsForMore() {
+        var segmenter = StreamingSpeechSegmenter()
+        #expect(segmenter.nextSegmentReadyToSpeak(streamedTextSoFar: "sure. that's the") == nil)
+        #expect(segmenter.nextSegmentReadyToSpeak(streamedTextSoFar: "sure. that's the color inspector. it") == "sure. that's the color inspector.")
+    }
+
+    @MainActor @Test func pointTagIsNeverSpoken() {
+        var segmenter = StreamingSpeechSegmenter()
+        let streamedAnswer = "see that source control menu up top? click that and hit commit. [POINT:285,11:source control]"
+        #expect(segmenter.nextSegmentReadyToSpeak(streamedTextSoFar: streamedAnswer) == "see that source control menu up top?")
+        // The rest comes once the answer is complete, without the tag
+        let parsed = CompanionManager.parsePointingCoordinates(from: streamedAnswer)
+        #expect(segmenter.remainingSegmentToSpeak(finalSpokenText: parsed.spokenText) == "click that and hit commit.")
+        #expect(segmenter.releasedSpeechText == "see that source control menu up top? click that and hit commit.")
+    }
+
+    @Test func silentReplyIsNeverSpoken() {
+        var segmenter = StreamingSpeechSegmenter()
+        #expect(segmenter.nextSegmentReadyToSpeak(streamedTextSoFar: "[SILENT] the user was talking. to someone else. ") == nil)
+    }
+
+    @Test func decimalNumbersDontEndASentence() {
+        var segmenter = StreamingSpeechSegmenter()
+        #expect(segmenter.nextSegmentReadyToSpeak(streamedTextSoFar: "set the line height to 1.5 so the") == nil)
+    }
+
+    @Test func singleSentenceAnswerIsSpokenWhole() {
+        var segmenter = StreamingSpeechSegmenter()
+        #expect(segmenter.nextSegmentReadyToSpeak(streamedTextSoFar: "that's the save button.") == nil)
+        #expect(segmenter.remainingSegmentToSpeak(finalSpokenText: "that's the save button.") == "that's the save button.")
+        #expect(segmenter.remainingSegmentToSpeak(finalSpokenText: "that's the save button.") == nil)
+    }
+}
+
+struct ClickySpeechInterruptionDetectorTests {
+    private let clickySpeech = "you'll want to open the color inspector. it's right up in the top right area of the toolbar."
+
+    @Test func clickysOwnVoiceIsNotTheUser() {
+        let userWords = ClickySpeechInterruptionDetector.userWords(
+            heardText: "open the color inspector it's right up in the top",
+            clickySpeechText: clickySpeech
+        )
+        #expect(userWords.isEmpty)
+        #expect(ClickySpeechInterruptionDetector.interruptionResponse(toUserWords: userWords) == .none)
+    }
+
+    @Test func misheardEchoWordsStillCountAsClicky() {
+        // The microphone hears the speakers through the room, so a word or two
+        // comes out wrong
+        let userWords = ClickySpeechInterruptionDetector.userWords(
+            heardText: "open the colour inspector it's right up in the top right area",
+            clickySpeechText: clickySpeech
+        )
+        #expect(userWords.isEmpty)
+    }
+
+    @Test func userTalkingOverTheEndIsFound() {
+        let userWords = ClickySpeechInterruptionDetector.userWords(
+            heardText: "open the color inspector it's right up where is the export button",
+            clickySpeechText: clickySpeech
+        )
+        #expect(userWords == ["where", "is", "the", "export", "button"])
+        #expect(ClickySpeechInterruptionDetector.interruptionResponse(toUserWords: userWords) == .stopClicky)
+    }
+
+    @Test func sayingWaitInterruptsRightAway() {
+        let userWords = ClickySpeechInterruptionDetector.userWords(
+            heardText: "you'll want to open the color wait",
+            clickySpeechText: clickySpeech
+        )
+        #expect(userWords == ["wait"])
+        #expect(ClickySpeechInterruptionDetector.interruptionResponse(toUserWords: userWords) == .stopClicky)
+        #expect(ClickySpeechInterruptionDetector.isOnlyAskingClickyToStop(userWords: userWords))
+    }
+
+    @Test func oneWordIsNotEnoughToStopClicky() {
+        // Might be a misheard bit of Clicky's own voice
+        let userWords = ClickySpeechInterruptionDetector.userWords(
+            heardText: "you'll want to open the color um",
+            clickySpeechText: clickySpeech
+        )
+        #expect(ClickySpeechInterruptionDetector.interruptionResponse(toUserWords: userWords) == .oneWordSoFar)
+    }
+
+    @Test func keepTalkingAndClickyStops() {
+        #expect(ClickySpeechInterruptionDetector.interruptionResponse(toUserWords: ["um", "actually"]) == .stopClicky)
+    }
+
+    @Test func userStopWordsStopClickyAndSendNothing() {
+        for stopPhrase in ["wait", "hold up", "one sec", "pause", "Clicky", "hey Clicky", "HeyClicky"] {
+            let userWords = ComputerAudioEchoDetector.normalizedWords(in: stopPhrase)
+            #expect(ClickySpeechInterruptionDetector.interruptionResponse(toUserWords: userWords) == .stopClicky)
+            #expect(ClickySpeechInterruptionDetector.isOnlyAskingClickyToStop(userWords: userWords))
+        }
+    }
+
+    @Test func aSharedWordDoesNotSwallowTheQuestion() {
+        // "the" appears in Clicky's speech, but on its own it isn't an echo
+        let userWords = ClickySpeechInterruptionDetector.userWords(
+            heardText: "where is the menu",
+            clickySpeechText: clickySpeech
+        )
+        #expect(userWords == ["where", "is", "the", "menu"])
+    }
+
+    @Test func misheardBitsOfClickysVoiceDoNotFadeIt() {
+        // Real cases from testing that made Clicky fade out and back in
+        let clickyAnswer = "yeah so this is the github page for clicky. farza built it and open sourced the whole thing."
+        for heardText in [
+            "yeah",                                  // first word, nothing to pair with yet
+            "yeah so this is the gi",                // "github" cut off mid-word
+            "this is the github page for click",     // "clicky" with a different ending
+            "farza built it far",                    // "farza" cut off
+            "open source"                            // "sourced" heard as "source"
+        ] {
+            let userWords = ClickySpeechInterruptionDetector.userWordsWhileClickyTalks(
+                heardText: heardText, clickySpeechText: clickyAnswer)
+            #expect(userWords.isEmpty, "\(heardText) -> \(userWords)")
+        }
+    }
+
+    @Test func soundAlikesStemsAndNumbersDoNotFadeClicky() {
+        // Second round of real cases from testing
+        let clickyAnswer = "so this is the github repository for clicky. it's open source, and you can see it's got 7.7k stars."
+        for heardText in [
+            "so this is the get",          // "github" heard as "get"
+            "repository for clicking",     // "clicky" heard as "clicking"
+            "it's got seven point seven k" // "7.7k" heard as words
+        ] {
+            let userWords = ClickySpeechInterruptionDetector.userWordsWhileClickyTalks(
+                heardText: heardText, clickySpeechText: clickyAnswer)
+            #expect(userWords.isEmpty, "\(heardText) -> \(userWords)")
+        }
+    }
+
+    @Test func realInterruptionsStillCountWhileClickyTalks() {
+        let clickyAnswer = "yeah so this is the github page for clicky. farza built it and open sourced the whole thing."
+        let umWords = ClickySpeechInterruptionDetector.userWordsWhileClickyTalks(
+            heardText: "this is the github page um", clickySpeechText: clickyAnswer)
+        #expect(ClickySpeechInterruptionDetector.interruptionResponse(toUserWords: umWords) == .oneWordSoFar)
+
+        let waitWords = ClickySpeechInterruptionDetector.userWordsWhileClickyTalks(
+            heardText: "this is the github page wait", clickySpeechText: clickyAnswer)
+        #expect(ClickySpeechInterruptionDetector.interruptionResponse(toUserWords: waitWords) == .stopClicky)
+
+        let questionWords = ClickySpeechInterruptionDetector.userWordsWhileClickyTalks(
+            heardText: "this is the github page how do I fork", clickySpeechText: clickyAnswer)
+        #expect(ClickySpeechInterruptionDetector.interruptionResponse(toUserWords: questionWords) == .stopClicky)
+    }
+
+    @Test func realQuestionsAreNotStopOnly() {
+        #expect(ClickySpeechInterruptionDetector.isOnlyAskingClickyToStop(userWords: ["hold", "on"]))
+        #expect(ClickySpeechInterruptionDetector.isOnlyAskingClickyToStop(userWords: ["never", "mind", "thanks"]))
+        #expect(!ClickySpeechInterruptionDetector.isOnlyAskingClickyToStop(userWords: ["wait", "where", "is", "export"]))
+    }
+}
+
+struct CaptionsToggleCommandTests {
+    private let controlShiftFlags = UInt64(NSEvent.ModifierFlags([.control, .shift]).rawValue)
+
+    @Test func controlShiftCTogglesCaptions() {
+        #expect(CaptionsToggleShortcut.isCaptionsTogglePress(
+            eventType: .keyDown, keyCode: 8, modifierFlagsRawValue: controlShiftFlags, isAutorepeat: false
+        ))
+    }
+
+    @Test func holdingTheKeysDoesNotFlipBackAndForth() {
+        #expect(!CaptionsToggleShortcut.isCaptionsTogglePress(
+            eventType: .keyDown, keyCode: 8, modifierFlagsRawValue: controlShiftFlags, isAutorepeat: true
+        ))
+    }
+
+    @Test func otherCombinationsDoNotToggleCaptions() {
+        let commandShiftFlags = UInt64(NSEvent.ModifierFlags([.command, .shift]).rawValue)
+        let controlOptionShiftFlags = UInt64(NSEvent.ModifierFlags([.control, .option, .shift]).rawValue)
+        #expect(!CaptionsToggleShortcut.isCaptionsTogglePress(eventType: .keyDown, keyCode: 8, modifierFlagsRawValue: commandShiftFlags, isAutorepeat: false))
+        #expect(!CaptionsToggleShortcut.isCaptionsTogglePress(eventType: .keyDown, keyCode: 8, modifierFlagsRawValue: controlOptionShiftFlags, isAutorepeat: false))
+        // ctrl + shift + v
+        #expect(!CaptionsToggleShortcut.isCaptionsTogglePress(eventType: .keyDown, keyCode: 9, modifierFlagsRawValue: controlShiftFlags, isAutorepeat: false))
+    }
+
+    @Test func voiceCommandsTurnCaptionsOnAndOff() {
+        #expect(CaptionsVoiceCommand.requestedCaptionsSetting("Captions on.") == true)
+        #expect(CaptionsVoiceCommand.requestedCaptionsSetting("turn on captions please") == true)
+        #expect(CaptionsVoiceCommand.requestedCaptionsSetting("caption off") == false)
+        #expect(CaptionsVoiceCommand.requestedCaptionsSetting("Hide captions!") == false)
+    }
+
+    @Test func questionsAboutCaptionsAreNotCommands() {
+        #expect(CaptionsVoiceCommand.requestedCaptionsSetting("how do I turn on captions in youtube videos") == nil)
+        #expect(CaptionsVoiceCommand.requestedCaptionsSetting("where is the export button") == nil)
+    }
+}
+
+struct RepeatLastAnswerRequestTests {
+    @Test func commonWaysOfAskingToRepeatAreRecognized() {
+        for repeatRequest in ["say that again", "Can you say that again?", "sorry, what did you say?",
+                              "repeat that please", "Repeat.", "come again?", "one more time"] {
+            #expect(RepeatLastAnswerRequest.isAskingToRepeatLastAnswer(repeatRequest), "\(repeatRequest)")
+        }
+    }
+
+    @Test func realQuestionsAreNotTreatedAsRepeatRequests() {
+        for realQuestion in ["what was that error that just popped up", "where is the export button",
+                             "how do I repeat a calendar event every week on mondays"] {
+            #expect(!RepeatLastAnswerRequest.isAskingToRepeatLastAnswer(realQuestion), "\(realQuestion)")
+        }
+    }
+}
+
 // MARK: - Computer Audio Echo
 
 struct ComputerAudioEchoDetectorTests {
@@ -307,19 +683,31 @@ struct TrackedElementPositionEstimatorTests {
         #expect(estimator.estimatedScreenLocation == CGPoint(x: 500, y: 400))
     }
 
-    @Test func learnsWhenContentMovesOppositeToTheScrollDeltas() {
+    @Test func matchThatStaysPutWhileScrollingIsIgnored() {
+        // GitHub pins a copy of the repo's Fork button at the top. The tracker
+        // keeps finding that copy in the same place while the page scrolls.
         var estimator = TrackedElementPositionEstimator(initialScreenLocation: startLocation, frameCaptureTimestamp: 0)
-        var measuredLocation = startLocation
-
-        // Each frame interval: 40pt of scroll, but the content actually moves UP 40pt
-        for frameIndex in 1...8 {
+        for frameIndex in 1...6 {
             let frameTimestamp = Double(frameIndex) * 0.1
-            estimator.applyScrollWheelMovement(scrollingDeltaX: 0, scrollingDeltaY: 40, timestamp: frameTimestamp - 0.05)
-            measuredLocation.y += 40
-            estimator.applyTrackingMeasurement(measuredScreenLocation: measuredLocation, frameCaptureTimestamp: frameTimestamp)
+            estimator.applyScrollWheelMovement(scrollingDeltaX: 0, scrollingDeltaY: -50, timestamp: frameTimestamp - 0.05)
+            let wasTrusted = estimator.applyTrackingMeasurement(measuredScreenLocation: startLocation, frameCaptureTimestamp: frameTimestamp)
+            #expect(!wasTrusted)
         }
+        // The buddy follows the scrolling (up 300pt), and the scale isn't
+        // "learned" down to zero
+        #expect(estimator.estimatedScreenLocation.y == startLocation.y + 300)
+        #expect(estimator.scrollToScreenMovementScale == 1)
+    }
 
-        #expect(estimator.scrollToScreenMovementScale < -0.9)
+    @Test func matchMovingWithScrollingIsStillTrusted() {
+        var estimator = TrackedElementPositionEstimator(initialScreenLocation: startLocation, frameCaptureTimestamp: 0)
+        estimator.applyScrollWheelMovement(scrollingDeltaX: 0, scrollingDeltaY: -50, timestamp: 0.05)
+        // Moved 45pt up for 50pt of scroll: the real element
+        let wasTrusted = estimator.applyTrackingMeasurement(
+            measuredScreenLocation: CGPoint(x: startLocation.x, y: startLocation.y + 45),
+            frameCaptureTimestamp: 0.1
+        )
+        #expect(wasTrusted)
     }
 
     @Test func learnsAppsThatScrollFasterThanTheDeltas() {

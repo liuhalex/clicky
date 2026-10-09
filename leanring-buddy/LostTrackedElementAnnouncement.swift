@@ -98,6 +98,64 @@ nonisolated enum TrackedElementLastSeenPosition: Equatable {
         return farthestPastEdge.0
     }
 
+    /// Scrolling at least this far (points, in the last second) toward an
+    /// edge counts as the user scrolling the element away.
+    static let minimumRecentScrollMovementToCountAsScrolledAway: CGFloat = 20
+
+    /// Content usually disappears well before the screen edge: under the
+    /// browser's tab and address bar, an app's toolbar, or a website's sticky
+    /// header. So the position estimate can still be on screen when the
+    /// element is gone. If the user was scrolling it toward an edge when it
+    /// vanished, and it was in that half of the display, it scrolled off that
+    /// way. Returns nil if they weren't scrolling it away (for example they
+    /// clicked a link or switched tabs).
+    static func fromRecentScrolling(
+        estimatedScreenLocation: CGPoint,
+        displayFrame: CGRect,
+        recentScrollDrivenScreenMovement: CGVector
+    ) -> TrackedElementLastSeenPosition? {
+        let minimumMovement = minimumRecentScrollMovementToCountAsScrolledAway
+        let isMostlyVertical = abs(recentScrollDrivenScreenMovement.dy) >= abs(recentScrollDrivenScreenMovement.dx)
+
+        // AppKit's y axis points up: positive dy means carried toward the top
+        if isMostlyVertical {
+            if recentScrollDrivenScreenMovement.dy >= minimumMovement && estimatedScreenLocation.y > displayFrame.midY {
+                return .scrolledOffTop
+            }
+            if recentScrollDrivenScreenMovement.dy <= -minimumMovement && estimatedScreenLocation.y < displayFrame.midY {
+                return .scrolledOffBottom
+            }
+        } else {
+            if recentScrollDrivenScreenMovement.dx <= -minimumMovement && estimatedScreenLocation.x < displayFrame.midX {
+                return .movedOffLeft
+            }
+            if recentScrollDrivenScreenMovement.dx >= minimumMovement && estimatedScreenLocation.x > displayFrame.midX {
+                return .movedOffRight
+            }
+        }
+        return nil
+    }
+
+    /// Roughly the macOS menu bar plus a browser's tab and address bar.
+    /// Content scrolled up into this band is hidden under them.
+    static let topToolbarBandHeightInPoints: CGFloat = 150
+
+    /// Whether the scroll-driven estimate says the element has left view: past
+    /// a screen edge, or carried up under the menu bar and browser toolbar.
+    /// Used when the tracker's matches can't be trusted (they're stuck on a
+    /// sticky copy of the element), so the tracker never reports it missing.
+    static func hasScrolledOutOfView(
+        estimatedScreenLocation: CGPoint,
+        displayFrame: CGRect,
+        recentScrollDrivenScreenMovement: CGVector
+    ) -> Bool {
+        if !displayFrame.contains(estimatedScreenLocation) {
+            return true
+        }
+        let isBeingScrolledUp = recentScrollDrivenScreenMovement.dy >= minimumRecentScrollMovementToCountAsScrolledAway
+        return isBeingScrolledUp && estimatedScreenLocation.y > displayFrame.maxY - topToolbarBandHeightInPoints
+    }
+
     /// Names the third of the screen a location is in, the way a person would
     /// say it out loud: "top left", "bottom", "right", "middle".
     static func screenAreaDescription(of location: CGPoint, frameWidth: CGFloat, frameHeight: CGFloat) -> String {

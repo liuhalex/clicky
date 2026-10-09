@@ -17,6 +17,8 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// Press/release of the fn + control shortcut that turns hands-free on and
     /// off. Shares this event tap so the app only needs one keyboard listener.
     let liveSessionShortcutTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
+    /// Fires on ctrl + shift + c, which turns captions on or off.
+    let captionsToggleShortcutPublisher = PassthroughSubject<Void, Never>()
 
     private var globalEventTap: CFMachPort?
     private var globalEventTapRunLoopSource: CFRunLoopSource?
@@ -131,6 +133,15 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         case .released:
             isShortcutCurrentlyPressed = false
             shortcutTransitionPublisher.send(.released)
+        }
+
+        if CaptionsToggleShortcut.isCaptionsTogglePress(
+            eventType: eventType,
+            keyCode: eventKeyCode,
+            modifierFlagsRawValue: event.flags.rawValue,
+            isAutorepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+        ) {
+            captionsToggleShortcutPublisher.send()
         }
 
         let liveSessionShortcutTransition = LiveSessionToggleShortcut.shortcutTransition(
