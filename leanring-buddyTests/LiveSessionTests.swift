@@ -683,20 +683,61 @@ struct TrackedElementPositionEstimatorTests {
         #expect(estimator.estimatedScreenLocation == CGPoint(x: 500, y: 400))
     }
 
-    @Test func matchThatStaysPutWhileScrollingIsIgnored() {
-        // GitHub pins a copy of the repo's Fork button at the top. The tracker
-        // keeps finding that copy in the same place while the page scrolls.
+    @Test func pinnedCopyThatStopsMovingIsIgnored() {
+        // GitHub: the Fork button first scrolls up with the page, then the
+        // tracker finds the copy GitHub pins at the top, which stays put.
         var estimator = TrackedElementPositionEstimator(initialScreenLocation: startLocation, frameCaptureTimestamp: 0)
-        for frameIndex in 1...6 {
+        estimator.applyScrollWheelMovement(scrollingDeltaX: 0, scrollingDeltaY: -50, timestamp: 0.05)
+        let pinnedCopyLocation = CGPoint(x: startLocation.x, y: startLocation.y + 50)
+        let wasMeasurementTrusted1 = estimator.applyTrackingMeasurement(measuredScreenLocation: pinnedCopyLocation, frameCaptureTimestamp: 0.1)
+        #expect(wasMeasurementTrusted1)
+
+        for frameIndex in 2...6 {
             let frameTimestamp = Double(frameIndex) * 0.1
             estimator.applyScrollWheelMovement(scrollingDeltaX: 0, scrollingDeltaY: -50, timestamp: frameTimestamp - 0.05)
-            let wasTrusted = estimator.applyTrackingMeasurement(measuredScreenLocation: startLocation, frameCaptureTimestamp: frameTimestamp)
+            let wasTrusted = estimator.applyTrackingMeasurement(measuredScreenLocation: pinnedCopyLocation, frameCaptureTimestamp: frameTimestamp)
             #expect(!wasTrusted)
         }
-        // The buddy follows the scrolling (up 300pt), and the scale isn't
-        // "learned" down to zero
+        // The buddy keeps following the scrolling (up 300pt in total), and the
+        // scale isn't "learned" down to zero
         #expect(estimator.estimatedScreenLocation.y == startLocation.y + 300)
         #expect(estimator.scrollToScreenMovementScale == 1)
+        #expect(!estimator.isElementFixedOnScreen)
+    }
+
+    @Test func elementThatNeverScrollsStaysPut() {
+        // X: the Post button sits in a fixed sidebar while the feed scrolls.
+        var estimator = TrackedElementPositionEstimator(initialScreenLocation: startLocation, frameCaptureTimestamp: 0)
+        estimator.applyScrollWheelMovement(scrollingDeltaX: 0, scrollingDeltaY: -50, timestamp: 0.05)
+        let wasMeasurementTrusted2 = estimator.applyTrackingMeasurement(measuredScreenLocation: startLocation, frameCaptureTimestamp: 0.1)
+        #expect(wasMeasurementTrusted2)
+        #expect(estimator.isElementFixedOnScreen)
+        #expect(estimator.estimatedScreenLocation == startLocation)
+
+        // More feed scrolling no longer moves the buddy off the button
+        for frameIndex in 2...6 {
+            let frameTimestamp = Double(frameIndex) * 0.1
+            estimator.applyScrollWheelMovement(scrollingDeltaX: 0, scrollingDeltaY: -50, timestamp: frameTimestamp - 0.05)
+            #expect(estimator.estimatedScreenLocation == startLocation)
+            let wasMeasurementTrusted3 = estimator.applyTrackingMeasurement(measuredScreenLocation: startLocation, frameCaptureTimestamp: frameTimestamp)
+            #expect(wasMeasurementTrusted3)
+        }
+        // And it isn't reported as scrolled away
+        #expect(estimator.recentScrollDrivenScreenMovement(asOf: 0.65).dy == 0)
+    }
+
+    @Test func fixedElementThatStartsScrollingIsFollowedAgain() {
+        // The user scrolls the sidebar the element is in, not the feed
+        var estimator = TrackedElementPositionEstimator(initialScreenLocation: startLocation, frameCaptureTimestamp: 0)
+        estimator.applyScrollWheelMovement(scrollingDeltaX: 0, scrollingDeltaY: -50, timestamp: 0.05)
+        estimator.applyTrackingMeasurement(measuredScreenLocation: startLocation, frameCaptureTimestamp: 0.1)
+        #expect(estimator.isElementFixedOnScreen)
+
+        estimator.applyScrollWheelMovement(scrollingDeltaX: 0, scrollingDeltaY: -50, timestamp: 0.15)
+        let movedLocation = CGPoint(x: startLocation.x, y: startLocation.y + 48)
+        let wasMeasurementTrusted4 = estimator.applyTrackingMeasurement(measuredScreenLocation: movedLocation, frameCaptureTimestamp: 0.2)
+        #expect(wasMeasurementTrusted4)
+        #expect(!estimator.isElementFixedOnScreen)
     }
 
     @Test func matchMovingWithScrollingIsStillTrusted() {

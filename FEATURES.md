@@ -88,11 +88,12 @@ Also see [Improvements and Bug Fixes](#improvements-and-bug-fixes) for everythin
   - **Late frames:** each correction adds any scrolling that happened after the frame was captured.
   - **Self-calibrating:** it learns how far content moves per point of scroll (it measured 0.91 in Safari), which handles apps that scroll faster or slower than the scroll events say.
   - **Corrections are blended in** over a few frames (35% each) rather than applied at once, which fixed a shake. Mismatches over 60pt are applied in full.
-  - **Scrolling wins a disagreement:** a frame match that stays put while you scroll is ignored, because it has latched onto something that doesn't scroll (GitHub pins a copy of a repo's Watch / Fork / Star buttons at the top). The buddy follows the scrolling instead, and once that carries the element past an edge or up under the browser toolbar, Clicky says where it went.
+  - **Elements that don't scroll:** if, while you scroll, the element is found exactly where it was and has never moved with the scroll, it's fixed on screen (X's Post button in its sidebar while the feed scrolls). Scroll events stop moving the buddy, and it stays on the button. If you later scroll the panel it's in, it's followed again.
+  - **Pinned copies:** if the element *did* move with the scroll and then a match suddenly stops moving, it's a pinned copy (GitHub keeps a copy of a repo's Watch / Fork / Star buttons at the top). That match is ignored and the buddy follows the scrolling, and once that carries the element past an edge or under the browser toolbar, Clicky says where it went.
   - **Big jumps** (220pt+, e.g. page down) use the normal curved flight.
 - **Limits:**
   - A classic line-based mouse wheel falls back to frame-only following.
-  - Scrolling a different panel on the same screen moves the buddy briefly until the next frame corrects it.
+  - The first frame after you start scrolling decides whether the element is fixed, so on a fixed button the buddy can drift for about a tenth of a second before snapping back.
 - **Files:** `TrackedElementPositionEstimator.swift`, `OverlayWindow.swift`
 
 ## Flight Steering
@@ -276,7 +277,7 @@ Also see [Improvements and Bug Fixes](#improvements-and-bug-fixes) for everythin
   2. `TEST_HOST` pointed at `leanring-buddy.app` instead of `Clicky.app`.
   3. The tests imported `leanring_buddy` instead of the actual module, `Clicky`.
   4. The original test struct was missing `@MainActor`.
-- **Now:** 85 tests across 13 suites, run with Cmd+U.
+- **Now:** 87 tests across 13 suites, run with Cmd+U.
 - **Local development setup:**
   - Signing set to my personal team.
   - The Worker runs locally (`npx wrangler dev`) and the app points at `http://localhost:8787`.
@@ -328,6 +329,7 @@ Things found and fixed while building, newest first. These make a good story for
 
 | Problem | How it was found | Fix |
 |---|---|---|
+| On X, pointing at the Post button and scrolling the feed made the pointer drift off it | User testing; the log showed the tracker correctly finding the button in place, and every match being rejected | The GitHub fix assumed any match that stays put while scrolling is a pinned copy. A fixed sidebar button stays put too. Now: never moved with the scroll + found where it was = fixed on screen, so scroll events stop moving the buddy; moved with the scroll first, then stopped dead = pinned copy, ignored (3 tests) |
 | Clicky still stopped itself mid-answer, after three rounds of echo fixes | User testing | While Clicky's voice plays, only stop words stop it ("wait", "hold up", "one sec", "pause", "stop", "Clicky"); fading removed. Through laptop speakers, its own voice can't be reliably told apart from the user's by transcript alone |
 | Clicky said "[SILENT]" out loud | User testing (log) | Claude repeated its hands-free "stay quiet" reply to a push-to-talk question, and Clicky only checked for it in hands-free mode. Now it's never spoken in either mode |
 | Still fading after that fix | User testing; new log cases: "get" (github), "clicking" (clicky), "seven" (7.7k) | Two changes. Clicky now waits until a word has lasted 0.3s before reacting, because speech recognition revises its guesses ("gi" → "get" → "github"); clear stop words still act instantly. And echo matching now covers sound-alike starts, shared stems, and numbers read out as words |

@@ -14,11 +14,15 @@
 //  frame measurement also calibrates how much on-screen movement one point of
 //  scroll delta produces.
 //
-//  When scrolling and a frame match disagree, scrolling wins. A match that
-//  stays put while the user scrolls has latched onto something that doesn't
-//  scroll: GitHub, for example, keeps a copy of a repo's Watch / Fork / Star
-//  buttons pinned at the top. Trusting it froze the buddy and taught the
-//  estimator that the page doesn't scroll.
+//  Not everything on screen scrolls. When a match stays put while the user
+//  scrolls, it means one of two things:
+//  - The element doesn't scroll at all, like X's Post button in a fixed
+//    sidebar while the feed scrolls. Then it's found exactly where it was and
+//    has never moved with scrolling, so scroll events stop moving the buddy.
+//  - The tracker latched onto a pinned copy of an element that does scroll:
+//    GitHub keeps a copy of a repo's Watch / Fork / Star buttons at the top.
+//    The real element already moved with the scroll before the copy showed
+//    up, so a match that suddenly stops is ignored and scrolling wins.
 //
 //  All locations are global AppKit screen coordinates (bottom-left origin).
 //
@@ -51,6 +55,9 @@ nonisolated struct TrackedElementPositionEstimator {
     /// really is somewhere else (for example, it was re-found after a jump), so
     /// it's applied in full.
     static let correctionDistanceAppliedInFull: CGFloat = 60
+    /// While scrolling, an element found within this distance of where it was
+    /// (and never seen moving with the scroll) doesn't scroll at all.
+    static let maximumMovementOfFixedElementInPoints: CGFloat = 10
 
     private struct ScrollMovement {
         let timestamp: TimeInterval
@@ -64,6 +71,17 @@ nonisolated struct TrackedElementPositionEstimator {
     private var recentScrollMovements: [ScrollMovement] = []
     private var lastMeasuredScreenLocation: CGPoint
     private var lastMeasurementFrameCaptureTimestamp: TimeInterval
+    /// True once a frame showed the element moving with the scroll. After
+    /// that, a match that stops dead while scrolling is a pinned copy.
+    private var hasSeenElementMoveWithScrolling = false
+    /// True when the element stays put while the page scrolls (a fixed
+    /// sidebar or toolbar). Scroll events then don't move the estimate.
+    private(set) var isElementFixedOnScreen = false
+
+    /// How much scroll events move the estimate: none for a fixed element.
+    private var effectiveScrollToScreenMovementScale: CGFloat {
+        isElementFixedOnScreen ? 0 : scrollToScreenMovementScale
+    }
 
     init(initialScreenLocation: CGPoint, frameCaptureTimestamp: TimeInterval) {
         estimatedScreenLocation = initialScreenLocation
@@ -84,8 +102,8 @@ nonisolated struct TrackedElementPositionEstimator {
             scrollMovement.timestamp < timestamp - Self.scrollHistoryDurationSeconds
         }
 
-        estimatedScreenLocation.x += scrollToScreenMovementScale * scrollingDeltaX
-        estimatedScreenLocation.y -= scrollToScreenMovementScale * scrollingDeltaY
+        estimatedScreenLocation.x += effectiveScrollToScreenMovementScale * scrollingDeltaX
+        estimatedScreenLocation.y -= effectiveScrollToScreenMovementScale * scrollingDeltaY
     }
 
     /// Applies where the tracker found the element in a frame captured at
@@ -109,11 +127,26 @@ nonisolated struct TrackedElementPositionEstimator {
             let expectedVerticalMovement = -scrollToScreenMovementScale * verticalScrollBetweenFrames
             let didMoveWithScrolling = measuredVerticalMovement * expectedVerticalMovement > 0
                 && abs(measuredVerticalMovement) >= Self.minimumShareOfScrollMovementForTrustedMeasurement * abs(expectedVerticalMovement)
-            guard didMoveWithScrolling else {
-                // Keep the last good measurement, so the next match is checked
-                // against everything scrolled since then
+            if !didMoveWithScrolling {
+                let isFoundWhereItWas = abs(measuredVerticalMovement) <= Self.maximumMovementOfFixedElementInPoints
+                if isFoundWhereItWas && !hasSeenElementMoveWithScrolling {
+                    // Never moved with the scroll and still right where it
+                    // was: it doesn't scroll (a fixed sidebar). Stop moving
+                    // the buddy with scroll events and stay on it.
+                    isElementFixedOnScreen = true
+                    estimatedScreenLocation = measuredScreenLocation
+                    lastMeasuredScreenLocation = measuredScreenLocation
+                    lastMeasurementFrameCaptureTimestamp = frameCaptureTimestamp
+                    return true
+                }
+                // It moved with the scroll before, so this is a pinned copy or
+                // a look-alike. Keep the last good measurement, so the next
+                // match is checked against everything scrolled since then.
                 return false
             }
+            // It does scroll (for example, the user scrolled the sidebar it's in)
+            hasSeenElementMoveWithScrolling = true
+            isElementFixedOnScreen = false
             // Content moving down (positive delta) lowers AppKit y, hence the minus.
             let observedScale = -measuredVerticalMovement / verticalScrollBetweenFrames
             let clampedObservedScale = min(
@@ -125,8 +158,8 @@ nonisolated struct TrackedElementPositionEstimator {
 
         let scrollSinceFrameWasCaptured = totalScrollingDelta(after: frameCaptureTimestamp, upTo: .infinity)
         let correctedScreenLocation = CGPoint(
-            x: measuredScreenLocation.x + scrollToScreenMovementScale * scrollSinceFrameWasCaptured.deltaX,
-            y: measuredScreenLocation.y - scrollToScreenMovementScale * scrollSinceFrameWasCaptured.deltaY
+            x: measuredScreenLocation.x + effectiveScrollToScreenMovementScale * scrollSinceFrameWasCaptured.deltaX,
+            y: measuredScreenLocation.y - effectiveScrollToScreenMovementScale * scrollSinceFrameWasCaptured.deltaY
         )
 
         let correctionX = correctedScreenLocation.x - estimatedScreenLocation.x
@@ -147,15 +180,16 @@ nonisolated struct TrackedElementPositionEstimator {
 
     /// How far scrolling moved the element on screen during the last second
     /// before `currentTimestamp` (AppKit points, y up: positive y means it
-    /// was carried up). Zero if the user wasn't scrolling.
+    /// was carried up). Zero if the user wasn't scrolling, or if the element
+    /// doesn't scroll.
     func recentScrollDrivenScreenMovement(asOf currentTimestamp: TimeInterval) -> CGVector {
         let recentScrollingDelta = totalScrollingDelta(
             after: currentTimestamp - Self.scrollHistoryDurationSeconds,
             upTo: .infinity
         )
         return CGVector(
-            dx: scrollToScreenMovementScale * recentScrollingDelta.deltaX,
-            dy: -scrollToScreenMovementScale * recentScrollingDelta.deltaY
+            dx: effectiveScrollToScreenMovementScale * recentScrollingDelta.deltaX,
+            dy: -effectiveScrollToScreenMovementScale * recentScrollingDelta.deltaY
         )
     }
 
